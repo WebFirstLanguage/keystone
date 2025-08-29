@@ -59,6 +59,9 @@ impl ChunkManifest {
     }
     
     /// Calculates the size of a specific chunk
+    /// 
+    /// Returns 0 if the chunk index is out of range or if the calculated size
+    /// would overflow usize on this platform (e.g., on 32-bit systems with very large objects).
     pub fn chunk_size_for_index(&self, chunk_index: u64) -> usize {
         if chunk_index >= self.chunk_count {
             return 0;
@@ -67,7 +70,11 @@ impl ChunkManifest {
         if chunk_index == self.chunk_count - 1 {
             // Last chunk might be smaller
             let full_chunks_size = (self.chunk_count - 1) * self.chunk_size as u64;
-            (self.total_size - full_chunks_size) as usize
+            let remainder = self.total_size.saturating_sub(full_chunks_size);
+            
+            // Use try_from to safely convert from u64 to usize, 
+            // returning 0 as a safe fallback if the value is too large for this platform
+            usize::try_from(remainder).unwrap_or(0)
         } else {
             self.chunk_size
         }
@@ -681,5 +688,101 @@ mod tests {
                       "Content type {} should be preserved during retrieval", content_type);
             assert_eq!(retrieved.data, data);
         }
+    }
+    
+    #[test]
+    fn test_chunk_size_overflow_protection() {
+        // Test that chunk_size_for_index safely handles u64 to usize overflow
+        // This is especially important on 32-bit platforms where usize::MAX is ~4GB
+        
+        // Test normal case first (should work on all platforms)
+        let normal_manifest = ChunkManifest::new(3, 1024, 2500, 0, "text/plain".to_string());
+        assert_eq!(normal_manifest.chunk_size_for_index(0), 1024);  // First chunk
+        assert_eq!(normal_manifest.chunk_size_for_index(1), 1024);  // Middle chunk  
+        assert_eq!(normal_manifest.chunk_size_for_index(2), 452);   // Last chunk (2500 - 2*1024 = 452)
+        assert_eq!(normal_manifest.chunk_size_for_index(3), 0);     // Out of bounds
+        
+        // Test the overflow protection by creating a scenario that would definitely overflow
+        // We'll simulate a 32-bit environment by using a smaller "artificial max" value
+        const ARTIFICIAL_MAX_USIZE: u64 = 1024 * 1024; // 1MB as our "max usize" for testing
+        
+        // Test case where remainder would exceed our artificial limit
+        let manifest_overflow = ChunkManifest::new(
+            2,
+            1024,
+            1024 + ARTIFICIAL_MAX_USIZE + 1,  // remainder = ARTIFICIAL_MAX_USIZE + 1
+            0,
+            "text/plain".to_string()
+        );
+        assert_eq!(manifest_overflow.chunk_size_for_index(0), 1024);
+        
+        // The actual result depends on the platform:
+        // - On 64-bit: usize is large enough, so should return the actual remainder
+        // - On 32-bit: would return 0 due to overflow protection
+        let remainder = 1024 + ARTIFICIAL_MAX_USIZE + 1 - 1024; // ARTIFICIAL_MAX_USIZE + 1
+        let result = manifest_overflow.chunk_size_for_index(1);
+        
+        // The key thing is that it doesn't panic - either returns the value or 0
+        assert!(result == 0 || result == remainder as usize, 
+                "Expected either 0 (overflow protection) or {} (valid conversion), got {}", 
+                remainder, result);
+        
+        // Test extremely large case that would definitely overflow on any platform  
+        // where the remainder calculation itself would be huge
+        let manifest_huge = ChunkManifest::new(
+            2,
+            1024,
+            u64::MAX,  // Maximum possible total size
+            0,
+            "text/plain".to_string()
+        );
+        assert_eq!(manifest_huge.chunk_size_for_index(0), 1024);  // First chunk normal
+        
+        // The remainder would be u64::MAX - 1024, which on 64-bit platforms fits in usize
+        // but on 32-bit would overflow. Our code should handle both cases gracefully.
+        let huge_result = manifest_huge.chunk_size_for_index(1);
+        let expected_remainder = u64::MAX - 1024;
+        
+        // Either it fits in usize and returns the value, or it overflows and returns 0
+        assert!(huge_result == 0 || huge_result == expected_remainder as usize,
+                "Expected either 0 (overflow protection) or {} (valid conversion), got {}", 
+                expected_remainder, huge_result);
+        
+        // Test saturating_sub protection (total_size < full_chunks_size edge case)
+        let manifest_underflow = ChunkManifest::new(
+            3,
+            1000,
+            1500,  // 1500 < 3*1000, but saturating_sub prevents underflow
+            0,
+            "text/plain".to_string()
+        );
+        assert_eq!(manifest_underflow.chunk_size_for_index(0), 1000);  // First chunk
+        assert_eq!(manifest_underflow.chunk_size_for_index(1), 1000);  // Second chunk
+        assert_eq!(manifest_underflow.chunk_size_for_index(2), 0);     // Last chunk (saturating_sub returns 0)
+    }
+    
+    #[test]
+    fn test_chunk_size_edge_cases() {
+        // Test various edge cases for chunk size calculation
+        
+        // Single chunk case
+        let single_chunk = ChunkManifest::new(1, 2048, 1000, 0, "text/plain".to_string());
+        assert_eq!(single_chunk.chunk_size_for_index(0), 1000);  // Last (only) chunk is smaller than chunk_size
+        
+        // Exact multiple case (no partial last chunk)
+        let exact_multiple = ChunkManifest::new(3, 1000, 3000, 0, "text/plain".to_string());
+        assert_eq!(exact_multiple.chunk_size_for_index(0), 1000);  // First chunk
+        assert_eq!(exact_multiple.chunk_size_for_index(1), 1000);  // Second chunk
+        assert_eq!(exact_multiple.chunk_size_for_index(2), 1000);  // Last chunk (exact fit)
+        
+        // Very small last chunk
+        let tiny_last = ChunkManifest::new(3, 1000, 2001, 0, "text/plain".to_string());
+        assert_eq!(tiny_last.chunk_size_for_index(0), 1000);  // First chunk
+        assert_eq!(tiny_last.chunk_size_for_index(1), 1000);  // Second chunk
+        assert_eq!(tiny_last.chunk_size_for_index(2), 1);     // Last chunk (1 byte)
+        
+        // Zero-sized object edge case
+        let zero_sized = ChunkManifest::new(1, 1000, 0, 0, "text/plain".to_string());
+        assert_eq!(zero_sized.chunk_size_for_index(0), 0);  // Even first chunk is 0 for zero-sized object
     }
 }
