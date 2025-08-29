@@ -8,6 +8,7 @@ use crate::data::{Object, ObjectMetadata};
 use crate::data::keys::{generate_chunk_key, generate_chunk_prefix, parse_chunk_key};
 use crate::storage::{KeyValueStore, StorageError, StorageResult, Transaction};
 use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
 
 /// Default chunk size: 8MB
 /// This provides a good balance between memory usage and I/O efficiency
@@ -391,20 +392,19 @@ impl ChunkingStrategy {
         Ok(chunks)
     }
     
-    /// Calculates a simple checksum for data integrity verification
+    /// Calculate SHA-256 checksum for data integrity verification
     /// 
-    /// This is a simple implementation using a rolling hash.
-    /// For production, consider using a cryptographic hash like SHA-256.
+    /// Uses cryptographic hash function for robust integrity checking
+    /// and tamper detection. Returns first 8 bytes of SHA-256 hash as u64.
     fn calculate_checksum(&self, data: &[u8]) -> u64 {
-        let mut hash: u64 = 0;
-        for (i, &byte) in data.iter().enumerate() {
-            hash = hash.wrapping_mul(31).wrapping_add(byte as u64);
-            // Add position dependency to make hash more robust
-            if i % 256 == 255 {
-                hash = hash.wrapping_mul(37);
-            }
-        }
-        hash
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let hash_result = hasher.finalize();
+        
+        // Convert first 8 bytes of SHA-256 to u64
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&hash_result[..8]);
+        u64::from_be_bytes(bytes)
     }
 }
 
@@ -576,6 +576,33 @@ mod tests {
         
         // Different data should produce different checksums (with high probability)
         assert_ne!(checksum1, checksum3);
+    }
+    
+    #[test]
+    fn test_sha256_checksum_properties() {
+        let strategy = ChunkingStrategy::new();
+        
+        // Test that we're using SHA-256 by verifying properties
+        let data = b"test data for SHA-256 verification";
+        let checksum = strategy.calculate_checksum(data);
+        
+        // Verify the checksum is deterministic
+        let checksum2 = strategy.calculate_checksum(data);
+        assert_eq!(checksum, checksum2);
+        
+        // Verify small changes produce completely different checksums (avalanche effect)
+        let similar_data = b"test data for SHA-256 verificatioN"; // Changed last 'n' to 'N'
+        let similar_checksum = strategy.calculate_checksum(similar_data);
+        assert_ne!(checksum, similar_checksum);
+        
+        // Verify empty data produces a consistent checksum
+        let empty_checksum = strategy.calculate_checksum(b"");
+        let empty_checksum2 = strategy.calculate_checksum(b"");
+        assert_eq!(empty_checksum, empty_checksum2);
+        
+        // Verify the checksum is not zero (SHA-256 should never produce all zeros for any input)
+        assert_ne!(checksum, 0);
+        assert_ne!(empty_checksum, 0);
     }
     
     #[test]

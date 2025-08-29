@@ -8,6 +8,12 @@ use crate::storage::StorageError;
 /// The null byte separator used in composite keys
 const SEPARATOR: u8 = 0;
 
+/// Maximum length for bucket names (in bytes) - prevents memory exhaustion
+pub const MAX_BUCKET_NAME_LENGTH: usize = 1024; // 1KB
+
+/// Maximum length for object keys (in bytes) - prevents memory exhaustion  
+pub const MAX_OBJECT_KEY_LENGTH: usize = 1024; // 1KB
+
 /// Prefix for bucket metadata keys
 const BUCKET_METADATA_PREFIX: &[u8] = b"__meta__";
 const BUCKET_SECTION: &[u8] = b"bucket";
@@ -296,11 +302,25 @@ pub fn parse_chunk_key(chunk_key: &[u8]) -> Result<(String, String, u64), Storag
     Ok((bucket_name, object_key, chunk_number))
 }
 
-/// Validates that user input doesn't contain null bytes
-fn validate_user_input(input: &str, _field_name: &str) -> Result<(), StorageError> {
+/// Validates user input for bucket names and object keys
+/// 
+/// Checks for null bytes (which would break key parsing) and enforces length limits
+/// to prevent memory exhaustion attacks.
+fn validate_user_input(input: &str, field_name: &str) -> Result<(), StorageError> {
     if input.contains('\0') {
         return Err(StorageError::InvalidKey);
     }
+    
+    let max_length = match field_name {
+        "bucket name" => MAX_BUCKET_NAME_LENGTH,
+        "object key" | "key prefix" => MAX_OBJECT_KEY_LENGTH,
+        _ => MAX_OBJECT_KEY_LENGTH, // Default to object key limit
+    };
+    
+    if input.len() > max_length {
+        return Err(StorageError::InvalidKey);
+    }
+    
     Ok(())
 }
 
@@ -420,6 +440,81 @@ mod tests {
         assert_eq!(parsed_bucket, bucket);
         assert_eq!(parsed_object, object);
         assert_eq!(parsed_chunk, chunk_num);
+    }
+
+    #[test]
+    fn test_key_length_validation() {
+        // Test bucket name length validation
+        let max_bucket = "a".repeat(MAX_BUCKET_NAME_LENGTH);
+        let too_long_bucket = "a".repeat(MAX_BUCKET_NAME_LENGTH + 1);
+        
+        // Valid bucket name should work
+        assert!(generate_object_key(&max_bucket, "test").is_ok());
+        
+        // Too long bucket name should fail
+        assert!(generate_object_key(&too_long_bucket, "test").is_err());
+        
+        // Test object key length validation  
+        let max_object_key = "b".repeat(MAX_OBJECT_KEY_LENGTH);
+        let too_long_object_key = "b".repeat(MAX_OBJECT_KEY_LENGTH + 1);
+        
+        // Valid object key should work
+        assert!(generate_object_key("test", &max_object_key).is_ok());
+        
+        // Too long object key should fail
+        assert!(generate_object_key("test", &too_long_object_key).is_err());
+        
+        // Test that both bucket and object key validation work together
+        assert!(generate_object_key(&too_long_bucket, &too_long_object_key).is_err());
+    }
+    
+    #[test] 
+    fn test_key_length_validation_edge_cases() {
+        // Test empty strings (should be valid)
+        assert!(generate_object_key("", "").is_ok());
+        
+        // Test single character (should be valid)
+        assert!(generate_object_key("a", "b").is_ok());
+        
+        // Test exactly at the limit
+        let exactly_max_bucket = "x".repeat(MAX_BUCKET_NAME_LENGTH);
+        let exactly_max_object = "y".repeat(MAX_OBJECT_KEY_LENGTH);
+        assert!(generate_object_key(&exactly_max_bucket, &exactly_max_object).is_ok());
+        
+        // Test one over the limit  
+        let one_over_bucket = "x".repeat(MAX_BUCKET_NAME_LENGTH + 1);
+        let one_over_object = "y".repeat(MAX_OBJECT_KEY_LENGTH + 1);
+        assert!(generate_object_key(&one_over_bucket, "test").is_err());
+        assert!(generate_object_key("test", &one_over_object).is_err());
+    }
+    
+    #[test]
+    fn test_bucket_metadata_key_length_validation() {
+        // Test bucket metadata key generation with length limits
+        let max_bucket = "z".repeat(MAX_BUCKET_NAME_LENGTH);
+        let too_long_bucket = "z".repeat(MAX_BUCKET_NAME_LENGTH + 1);
+        
+        // Valid bucket name should work
+        assert!(generate_bucket_metadata_key(&max_bucket).is_ok());
+        
+        // Too long bucket name should fail
+        assert!(generate_bucket_metadata_key(&too_long_bucket).is_err());
+    }
+    
+    #[test]
+    fn test_chunk_key_length_validation() {
+        // Test chunk key generation with length limits
+        let max_bucket = "a".repeat(MAX_BUCKET_NAME_LENGTH);
+        let max_object = "b".repeat(MAX_OBJECT_KEY_LENGTH);
+        let too_long_bucket = "a".repeat(MAX_BUCKET_NAME_LENGTH + 1);
+        let too_long_object = "b".repeat(MAX_OBJECT_KEY_LENGTH + 1);
+        
+        // Valid keys should work
+        assert!(generate_chunk_key(&max_bucket, &max_object, 0).is_ok());
+        
+        // Too long keys should fail
+        assert!(generate_chunk_key(&too_long_bucket, "test", 0).is_err());
+        assert!(generate_chunk_key("test", &too_long_object, 0).is_err());
     }
     
     #[test]
