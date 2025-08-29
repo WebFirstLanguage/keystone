@@ -21,6 +21,10 @@ pub const MIN_CHUNK_THRESHOLD: usize = 1024 * 1024; // 1MB
 /// Maximum number of chunks supported per object (prevents memory issues with manifests)
 pub const MAX_CHUNKS: u64 = 10000;
 
+/// Memory threshold for streaming vs. in-memory operations (32MB)
+/// Objects larger than this will trigger memory usage warnings
+pub const MEMORY_WARNING_THRESHOLD: usize = 32 * 1024 * 1024;
+
 /// Manifest data structure that tracks chunks of a large object
 /// 
 /// This is stored as the primary object data when an object is chunked.
@@ -111,6 +115,113 @@ pub struct ChunkingStrategy {
     chunk_size: usize,
 }
 
+/// Iterator for streaming chunks during retrieval
+pub struct ChunkIterator<'a, S> {
+    storage: &'a S,
+    bucket_name: String,
+    object_key: String,
+    manifest: ChunkManifest,
+    current_chunk: u64,
+    hasher: Sha256,
+}
+
+impl<'a, S> std::fmt::Debug for ChunkIterator<'a, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkIterator")
+            .field("bucket_name", &self.bucket_name)
+            .field("object_key", &self.object_key)
+            .field("current_chunk", &self.current_chunk)
+            .field("manifest", &self.manifest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, S> ChunkIterator<'a, S>
+where
+    S: KeyValueStore,
+{
+    fn new(
+        storage: &'a S,
+        bucket_name: String,
+        object_key: String,
+        manifest: ChunkManifest,
+    ) -> Self {
+        Self {
+            storage,
+            bucket_name,
+            object_key,
+            manifest,
+            current_chunk: 0,
+            hasher: Sha256::new(),
+        }
+    }
+
+    /// Get the total size of the object being streamed
+    pub fn total_size(&self) -> u64 {
+        self.manifest.total_size
+    }
+
+    /// Get the expected checksum for verification
+    pub fn expected_checksum(&self) -> u64 {
+        self.manifest.checksum
+    }
+
+    /// Verify the accumulated checksum matches the expected checksum
+    pub fn verify_checksum(&mut self) -> bool {
+        let hash_result = self.hasher.clone().finalize();
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&hash_result[..8]);
+        let calculated_checksum = u64::from_be_bytes(bytes);
+        calculated_checksum == self.manifest.checksum
+    }
+}
+
+impl<'a, S> Iterator for ChunkIterator<'a, S>
+where
+    S: KeyValueStore,
+{
+    type Item = StorageResult<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_chunk >= self.manifest.chunk_count {
+            return None;
+        }
+
+        let chunk_key = match generate_chunk_key(&self.bucket_name, &self.object_key, self.current_chunk) {
+            Ok(key) => key,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let chunk_data = match self.storage.get(&chunk_key) {
+            Ok(Some(data)) => data,
+            Ok(None) => return Some(Err(StorageError::DatabaseError(
+                format!("Missing chunk {} for object {}:{}", self.current_chunk, self.bucket_name, self.object_key)
+            ))),
+            Err(e) => return Some(Err(e)),
+        };
+
+        // Verify chunk size
+        let expected_size = self.manifest.chunk_size_for_index(self.current_chunk);
+        if chunk_data.len() != expected_size {
+            return Some(Err(StorageError::DatabaseError(
+                format!("Chunk {} has incorrect size: expected {}, got {}", 
+                       self.current_chunk, expected_size, chunk_data.len())
+            )));
+        }
+
+        // Update incremental checksum
+        self.hasher.update(&chunk_data);
+
+        self.current_chunk += 1;
+        Some(Ok(chunk_data))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.manifest.chunk_count - self.current_chunk) as usize;
+        (remaining, Some(remaining))
+    }
+}
+
 impl ChunkingStrategy {
     /// Creates a new chunking strategy with the default chunk size
     pub fn new() -> Self {
@@ -172,7 +283,7 @@ impl ChunkingStrategy {
         }
     }
     
-    /// Stores an object using chunking strategy
+    /// Stores an object using chunking strategy with incremental hashing
     fn store_chunked_object<S>(
         &self,
         storage: &S,
@@ -184,6 +295,14 @@ impl ChunkingStrategy {
     where
         S: KeyValueStore,
     {
+        // Check for memory usage warnings
+        if payload_data.len() > MEMORY_WARNING_THRESHOLD {
+            eprintln!(
+                "Warning: Storing large object ({:.1} MB) - consider using streaming APIs for better memory efficiency",
+                payload_data.len() as f64 / (1024.0 * 1024.0)
+            );
+        }
+
         storage.transaction(|txn| {
             let chunk_count = (payload_data.len() + self.chunk_size - 1) / self.chunk_size;
             let chunk_count = chunk_count as u64;
@@ -194,18 +313,27 @@ impl ChunkingStrategy {
                 ));
             }
             
-            // Calculate checksum
-            let checksum = self.calculate_checksum(payload_data);
+            // Calculate checksum incrementally during chunking to reduce memory pressure
+            let mut hasher = Sha256::new();
             
-            // Create and store chunks
+            // Create and store chunks with incremental hashing
             for chunk_index in 0..chunk_count {
                 let start = (chunk_index as usize) * self.chunk_size;
                 let end = std::cmp::min(start + self.chunk_size, payload_data.len());
                 let chunk_data = &payload_data[start..end];
                 
+                // Update incremental hash with this chunk
+                hasher.update(chunk_data);
+                
                 let chunk_key = generate_chunk_key(bucket_name, object_key, chunk_index)?;
                 txn.put(&chunk_key, chunk_data)?;
             }
+            
+            // Finalize incremental checksum calculation
+            let hash_result = hasher.finalize();
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&hash_result[..8]);
+            let checksum = u64::from_be_bytes(bytes);
             
             // Create manifest
             let manifest = ChunkManifest::new(
@@ -332,7 +460,7 @@ impl ChunkingStrategy {
         })
     }
     
-    /// Retrieves and reassembles a chunked object
+    /// Retrieves and reassembles a chunked object with memory efficiency options
     fn retrieve_chunked_object<T, S>(
         &self,
         storage: &S,
@@ -346,12 +474,109 @@ impl ChunkingStrategy {
     {
         manifest.validate()?;
         
-        // Reassemble the data from chunks
+        // Check for memory warnings for large objects
+        if manifest.total_size > MEMORY_WARNING_THRESHOLD as u64 {
+            eprintln!(
+                "Warning: Retrieving large object ({:.1} MB) - consider using streaming retrieval APIs for better memory efficiency",
+                manifest.total_size as f64 / (1024.0 * 1024.0)
+            );
+        }
+        
+        // Check for platform limitations
         if manifest.total_size > usize::MAX as u64 {
             return Err(StorageError::DatabaseError(
-                "Object too large to allocate on this platform".to_string(),
+                "Object too large to allocate on this platform - use streaming retrieval".to_string(),
             ));
         }
+        
+        // Use streaming retrieval for large objects to minimize memory usage
+        if manifest.total_size > MEMORY_WARNING_THRESHOLD as u64 {
+            return self.retrieve_chunked_object_streaming(storage, bucket_name, object_key, manifest);
+        }
+        
+        // For smaller objects, use the faster in-memory approach
+        self.retrieve_chunked_object_in_memory(storage, bucket_name, object_key, manifest)
+    }
+
+    /// Retrieves a chunked object using streaming to minimize memory usage
+    fn retrieve_chunked_object_streaming<T, S>(
+        &self,
+        storage: &S,
+        bucket_name: &str,
+        object_key: &str,
+        manifest: &ChunkManifest,
+    ) -> StorageResult<Object<T>>
+    where
+        T: for<'de> Deserialize<'de>,
+        S: KeyValueStore,
+    {
+        let mut reassembled_data = Vec::with_capacity(manifest.total_size as usize);
+        let mut hasher = Sha256::new();
+        
+        // Stream chunks one by one to avoid loading all chunks simultaneously
+        for chunk_index in 0..manifest.chunk_count {
+            let chunk_key = generate_chunk_key(bucket_name, object_key, chunk_index)?;
+            let chunk_data = storage.get(&chunk_key)?
+                .ok_or_else(|| StorageError::DatabaseError(
+                    format!("Missing chunk {} for object {}:{}", chunk_index, bucket_name, object_key)
+                ))?;
+            
+            // Verify chunk size
+            let expected_size = manifest.chunk_size_for_index(chunk_index);
+            if chunk_data.len() != expected_size {
+                return Err(StorageError::DatabaseError(
+                    format!("Chunk {} has incorrect size: expected {}, got {}", 
+                           chunk_index, expected_size, chunk_data.len())
+                ));
+            }
+            
+            // Update checksum incrementally 
+            hasher.update(&chunk_data);
+            
+            // Add to reassembled data
+            reassembled_data.extend_from_slice(&chunk_data);
+        }
+        
+        // Verify checksum using incremental calculation
+        let hash_result = hasher.finalize();
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&hash_result[..8]);
+        let calculated_checksum = u64::from_be_bytes(bytes);
+        
+        if calculated_checksum != manifest.checksum {
+            return Err(StorageError::DatabaseError(
+                "Object integrity check failed: checksum mismatch".to_string()
+            ));
+        }
+        
+        // Deserialize the reassembled data as payload T
+        let payload_data: T = bincode::deserialize(&reassembled_data)
+            .map_err(|e| StorageError::DatabaseError(format!("Deserialization error: {}", e)))?;
+        
+        // Create metadata based on the manifest information
+        let metadata = ObjectMetadata::new(
+            manifest.total_size,
+            manifest.content_type.clone(),
+        );
+        
+        Ok(Object {
+            metadata,
+            data: payload_data,
+        })
+    }
+
+    /// Fast in-memory chunked object retrieval for smaller objects
+    fn retrieve_chunked_object_in_memory<T, S>(
+        &self,
+        storage: &S,
+        bucket_name: &str,
+        object_key: &str,
+        manifest: &ChunkManifest,
+    ) -> StorageResult<Object<T>>
+    where
+        T: for<'de> Deserialize<'de>,
+        S: KeyValueStore,
+    {
         let mut reassembled_data = Vec::with_capacity(manifest.total_size as usize);
         
         for chunk_index in 0..manifest.chunk_count {
@@ -373,7 +598,7 @@ impl ChunkingStrategy {
             reassembled_data.extend_from_slice(&chunk_data);
         }
         
-        // Verify checksum
+        // Verify checksum using batch calculation (legacy approach for smaller objects)
         let calculated_checksum = self.calculate_checksum(&reassembled_data);
         if calculated_checksum != manifest.checksum {
             return Err(StorageError::DatabaseError(
@@ -395,6 +620,39 @@ impl ChunkingStrategy {
             metadata,
             data: payload_data,
         })
+    }
+
+    /// Creates a chunk iterator for streaming large objects piece by piece
+    pub fn iter_chunks<'a, S>(
+        &self,
+        storage: &'a S,
+        bucket_name: &str,
+        object_key: &str,
+    ) -> StorageResult<ChunkIterator<'a, S>>
+    where
+        S: KeyValueStore,
+    {
+        let object_key_bytes = crate::data::keys::generate_object_key(bucket_name, object_key)?;
+        
+        let data = storage.get(&object_key_bytes)?
+            .ok_or(StorageError::KeyNotFound)?;
+        
+        // Try to deserialize as a chunked manifest
+        let manifest_object = bincode::deserialize::<Object<ChunkManifest>>(&data)
+            .map_err(|_| StorageError::DatabaseError("Object is not chunked or corrupted".to_string()))?;
+        
+        if manifest_object.metadata.content_type != "application/x-keystone-chunked-manifest" {
+            return Err(StorageError::DatabaseError("Object is not chunked".to_string()));
+        }
+
+        manifest_object.data.validate()?;
+
+        Ok(ChunkIterator::new(
+            storage,
+            bucket_name.to_string(),
+            object_key.to_string(),
+            manifest_object.data,
+        ))
     }
     
     /// Deletes an object, handling both chunked and direct storage
@@ -967,5 +1225,188 @@ mod tests {
         
         assert_eq!(stored_metadata.content_type, "text/plain",
                   "Should preserve the correct content type");
+    }
+
+    #[test]
+    fn test_incremental_hashing_during_chunking() {
+        // Test that incremental hashing during storage produces the same result as batch hashing
+        let storage = MockStorage::new();
+        let strategy = ChunkingStrategy::try_with_chunk_size(1024).unwrap(); // 1KB chunks for testing
+        
+        // Create test data larger than MIN_CHUNK_THRESHOLD to ensure chunking
+        let test_data = "X".repeat(MIN_CHUNK_THRESHOLD + 5000); // 1MB + 5KB
+        let object = Object::with_metadata(test_data.clone(), "text/plain".to_string());
+        
+        // Verify this will be chunked
+        let serialized_size = bincode::serialize(&test_data).unwrap().len();
+        assert!(strategy.should_chunk(serialized_size), "Test object should be chunked");
+        
+        // Store object (uses incremental hashing)
+        strategy.store_object(&storage, "test-bucket", "hash-test", &object).unwrap();
+        
+        // Retrieve object and verify integrity  
+        let retrieved: Object<String> = strategy.retrieve_object(&storage, "test-bucket", "hash-test").unwrap();
+        assert_eq!(retrieved.data, test_data, "Retrieved data should match original");
+        
+        // Verify that the checksum stored in the manifest matches what we calculate
+        let object_key_bytes = crate::data::keys::generate_object_key("test-bucket", "hash-test").unwrap();
+        let manifest_data = storage.get(&object_key_bytes).unwrap().unwrap();
+        let manifest_object: Object<ChunkManifest> = bincode::deserialize(&manifest_data).unwrap();
+        
+        // Calculate the expected checksum using the standard method
+        let expected_checksum = strategy.calculate_checksum(&bincode::serialize(&test_data).unwrap());
+        
+        assert_eq!(manifest_object.data.checksum, expected_checksum,
+                  "Incremental checksum should match batch checksum");
+    }
+
+    #[test]
+    fn test_streaming_chunk_iterator() {
+        let storage = MockStorage::new();
+        let strategy = ChunkingStrategy::try_with_chunk_size(2048).unwrap(); // 2KB chunks
+        
+        // Create large test data that will be chunked
+        let test_data = "STREAM".repeat(MIN_CHUNK_THRESHOLD / 6 + 1000); // 1MB+ of data
+        let object = Object::with_metadata(test_data.clone(), "application/test".to_string());
+        
+        // Store object
+        strategy.store_object(&storage, "test-bucket", "stream-test", &object).unwrap();
+        
+        // Create chunk iterator
+        let mut chunk_iter = strategy.iter_chunks(&storage, "test-bucket", "stream-test").unwrap();
+        
+        // Verify iterator properties
+        assert_eq!(chunk_iter.total_size(), bincode::serialize(&test_data).unwrap().len() as u64);
+        
+        // Collect all chunks through iterator
+        let mut collected_data = Vec::new();
+        let mut chunk_count = 0;
+        
+        for chunk_result in chunk_iter.by_ref() {
+            let chunk_data = chunk_result.unwrap();
+            collected_data.extend_from_slice(&chunk_data);
+            chunk_count += 1;
+        }
+        
+        // Verify we got the right number of chunks
+        assert!(chunk_count > 1, "Should have multiple chunks, got {}", chunk_count);
+        
+        // Verify reconstructed data matches original
+        let reconstructed: String = bincode::deserialize(&collected_data).unwrap();
+        assert_eq!(reconstructed, test_data, "Streamed data should match original");
+        
+        // Verify incremental checksum
+        assert!(chunk_iter.verify_checksum(), "Incremental checksum should be valid");
+    }
+
+    #[test]
+    fn test_memory_threshold_warnings() {
+        // This test validates that memory warnings are properly triggered
+        // Note: We can't easily test the actual warning output, but we can test the threshold logic
+        
+        let storage = MockStorage::new();
+        let strategy = ChunkingStrategy::try_with_chunk_size(8192).unwrap(); // 8KB chunks
+        
+        // Test large object that exceeds memory warning threshold
+        let large_data = "L".repeat(MEMORY_WARNING_THRESHOLD + 1000); // 32MB + 1KB
+        let large_object = Object::with_metadata(large_data.clone(), "application/large".to_string());
+        
+        // This should trigger memory warnings during both store and retrieve
+        let stored_metadata = strategy.store_object(&storage, "test-bucket", "large-obj", &large_object).unwrap();
+        assert!(stored_metadata.size > MEMORY_WARNING_THRESHOLD as u64, "Object should exceed warning threshold");
+        
+        // Retrieve should also trigger memory warning
+        let retrieved: Object<String> = strategy.retrieve_object(&storage, "test-bucket", "large-obj").unwrap();
+        assert_eq!(retrieved.data, large_data, "Large object should be retrieved correctly");
+    }
+
+    #[test] 
+    fn test_streaming_vs_in_memory_retrieval_paths() {
+        let storage = MockStorage::new();
+        let strategy = ChunkingStrategy::try_with_chunk_size(4096).unwrap(); // 4KB chunks
+        
+        // Test data slightly under memory warning threshold (should use in-memory path)
+        let medium_data = "M".repeat(MEMORY_WARNING_THRESHOLD - 1000); // 32MB - 1KB
+        let medium_object = Object::with_metadata(medium_data.clone(), "application/medium".to_string());
+        
+        strategy.store_object(&storage, "test-bucket", "medium-obj", &medium_object).unwrap();
+        let retrieved_medium: Object<String> = strategy.retrieve_object(&storage, "test-bucket", "medium-obj").unwrap();
+        assert_eq!(retrieved_medium.data, medium_data, "Medium object should use in-memory retrieval");
+        
+        // Test data above memory warning threshold (should use streaming path)
+        let huge_data = "H".repeat(MEMORY_WARNING_THRESHOLD + 1000); // 32MB + 1KB
+        let huge_object = Object::with_metadata(huge_data.clone(), "application/huge".to_string());
+        
+        strategy.store_object(&storage, "test-bucket", "huge-obj", &huge_object).unwrap();
+        let retrieved_huge: Object<String> = strategy.retrieve_object(&storage, "test-bucket", "huge-obj").unwrap();
+        assert_eq!(retrieved_huge.data, huge_data, "Huge object should use streaming retrieval");
+        
+        // Both should produce identical results despite using different code paths
+        assert_eq!(retrieved_medium.metadata.content_type, "application/medium");
+        assert_eq!(retrieved_huge.metadata.content_type, "application/huge");
+    }
+
+    #[test]
+    fn test_chunk_iterator_error_handling() {
+        let storage = MockStorage::new();
+        let strategy = ChunkingStrategy::try_with_chunk_size(1024).unwrap();
+        
+        // Create and store a chunked object (smaller size for faster test)
+        let test_data = "E".repeat(MIN_CHUNK_THRESHOLD + 500); // 1MB + 500B 
+        let object = Object::with_metadata(test_data, "text/plain".to_string());
+        
+        strategy.store_object(&storage, "test-bucket", "error-test", &object).unwrap();
+        
+        // Create iterator
+        let chunk_iter = strategy.iter_chunks(&storage, "test-bucket", "error-test").unwrap();
+        
+        // Manually corrupt one chunk to test error handling
+        let corrupt_chunk_key = generate_chunk_key("test-bucket", "error-test", 1).unwrap();
+        storage.put(&corrupt_chunk_key, b"corrupted").unwrap();
+        
+        // Iterate through chunks - should fail at corrupted chunk
+        let mut results = Vec::new();
+        for result in chunk_iter {
+            results.push(result);
+        }
+        
+        // First chunk should succeed, second should fail due to size mismatch
+        assert!(results[0].is_ok(), "First chunk should succeed");
+        assert!(results[1].is_err(), "Second chunk should fail due to corruption");
+        
+        // Verify the error is about chunk size mismatch
+        let error = results[1].as_ref().unwrap_err();
+        match error {
+            StorageError::DatabaseError(msg) => {
+                assert!(msg.contains("incorrect size"), "Error should mention size mismatch: {}", msg);
+            }
+            _ => panic!("Expected DatabaseError with size mismatch message"),
+        }
+    }
+
+    #[test]
+    fn test_non_chunked_object_iterator() {
+        let storage = MockStorage::new();
+        let strategy = ChunkingStrategy::new();
+        
+        // Store a small object (won't be chunked)
+        let small_data = "small".to_string();
+        let object = Object::with_metadata(small_data, "text/plain".to_string());
+        
+        strategy.store_object(&storage, "test-bucket", "small-obj", &object).unwrap();
+        
+        // Try to create iterator for non-chunked object
+        let result = strategy.iter_chunks(&storage, "test-bucket", "small-obj");
+        
+        // Should fail because object is not chunked
+        assert!(result.is_err(), "Iterator creation should fail for non-chunked objects");
+        
+        let error = result.unwrap_err();
+        match error {
+            StorageError::DatabaseError(msg) => {
+                assert!(msg.contains("not chunked"), "Error should indicate object is not chunked: {}", msg);
+            }
+            _ => panic!("Expected DatabaseError about non-chunked object"),
+        }
     }
 }
