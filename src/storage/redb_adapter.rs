@@ -104,6 +104,11 @@ impl Transaction for RedbTransaction {
         
         Ok(Box::new(vec_iter.into_iter()))
     }
+    
+    fn commit(self) -> StorageResult<()> {
+        self.txn.commit()
+            .map_err(|e| StorageError::TransactionError(e.to_string()))
+    }
 }
 
 impl KeyValueStore for RedbAdapter {
@@ -112,6 +117,22 @@ impl KeyValueStore for RedbAdapter {
     fn open<P: AsRef<Path>>(path: P) -> StorageResult<Self> {
         let database = Database::create(path)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        
+        // Initialize the main table to ensure it exists for read operations
+        {
+            let write_txn = database.begin_write()
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            
+            // Opening the table in a write transaction creates it if it doesn't exist
+            {
+                let _table = write_txn.open_table(MAIN_TABLE)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+                // Table is dropped here, releasing the borrow on write_txn
+            }
+            
+            write_txn.commit()
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        }
         
         Ok(RedbAdapter { database })
     }
@@ -381,5 +402,101 @@ mod tests {
             .unwrap();
         
         assert_eq!(results.len(), 0);
+    }
+    
+    #[test]
+    fn test_manual_transaction_commit() {
+        let (adapter, _temp_dir) = create_test_adapter();
+        
+        // Verify initial state - key should not exist
+        assert_eq!(adapter.get(b"manual_key").unwrap(), None);
+        
+        // Begin a manual transaction
+        let mut txn = adapter.begin_transaction().unwrap();
+        
+        // Perform operations within the transaction
+        txn.put(b"manual_key", b"manual_value").unwrap();
+        txn.put(b"another_key", b"another_value").unwrap();
+        
+        // Before commit, changes should not be visible from outside the transaction
+        // Note: We can't easily test this with the current API since we'd need another adapter instance
+        
+        // Verify data is accessible within the transaction
+        assert_eq!(txn.get(b"manual_key").unwrap(), Some(b"manual_value".to_vec()));
+        assert_eq!(txn.get(b"another_key").unwrap(), Some(b"another_value".to_vec()));
+        
+        // Commit the transaction
+        txn.commit().unwrap();
+        
+        // After commit, changes should be visible via fresh non-transactional operations
+        assert_eq!(adapter.get(b"manual_key").unwrap(), Some(b"manual_value".to_vec()));
+        assert_eq!(adapter.get(b"another_key").unwrap(), Some(b"another_value".to_vec()));
+    }
+    
+    #[test]
+    fn test_manual_transaction_with_delete() {
+        let (adapter, _temp_dir) = create_test_adapter();
+        
+        // Put initial data
+        adapter.put(b"existing_key", b"existing_value").unwrap();
+        adapter.put(b"delete_me", b"delete_value").unwrap();
+        
+        // Verify initial state
+        assert_eq!(adapter.get(b"existing_key").unwrap(), Some(b"existing_value".to_vec()));
+        assert_eq!(adapter.get(b"delete_me").unwrap(), Some(b"delete_value".to_vec()));
+        
+        // Begin manual transaction and perform mixed operations
+        let mut txn = adapter.begin_transaction().unwrap();
+        txn.put(b"new_key", b"new_value").unwrap();
+        txn.delete(b"delete_me").unwrap();
+        
+        // Commit the transaction
+        txn.commit().unwrap();
+        
+        // Verify the results
+        assert_eq!(adapter.get(b"existing_key").unwrap(), Some(b"existing_value".to_vec())); // Unchanged
+        assert_eq!(adapter.get(b"new_key").unwrap(), Some(b"new_value".to_vec())); // Added
+        assert_eq!(adapter.get(b"delete_me").unwrap(), None); // Deleted
+    }
+    
+    #[test]
+    fn test_fresh_database_read_ready() {
+        let (adapter, _temp_dir) = create_test_adapter();
+        
+        // This test verifies that we can immediately read from a fresh database
+        // without needing any prior write operations - proving table initialization works
+        assert_eq!(adapter.get(b"nonexistent_key").unwrap(), None);
+        
+        // Also test that scan_prefix works immediately
+        let results: Vec<_> = adapter.scan_prefix(b"any_prefix")
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(results.len(), 0);
+    }
+    
+    #[test]
+    fn test_transaction_rollback_on_drop() {
+        let (adapter, _temp_dir) = create_test_adapter();
+        
+        // Put initial data
+        adapter.put(b"existing_key", b"existing_value").unwrap();
+        
+        {
+            // Begin transaction and make changes
+            let mut txn = adapter.begin_transaction().unwrap();
+            txn.put(b"temp_key", b"temp_value").unwrap();
+            txn.delete(b"existing_key").unwrap();
+            
+            // Verify changes are visible within transaction
+            assert_eq!(txn.get(b"temp_key").unwrap(), Some(b"temp_value".to_vec()));
+            assert_eq!(txn.get(b"existing_key").unwrap(), None);
+            
+            // Transaction is dropped here without calling commit()
+        }
+        
+        // Verify that changes were rolled back
+        assert_eq!(adapter.get(b"temp_key").unwrap(), None); // Should not exist
+        assert_eq!(adapter.get(b"existing_key").unwrap(), Some(b"existing_value".to_vec())); // Should be unchanged
     }
 }

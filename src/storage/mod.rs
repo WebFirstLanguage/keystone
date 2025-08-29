@@ -34,6 +34,10 @@ pub type StorageResult<T> = Result<T, StorageError>;
 pub type PrefixIterator = Box<dyn Iterator<Item = StorageResult<(Vec<u8>, Vec<u8>)>>>;
 
 /// Transaction handle for atomic operations
+/// 
+/// Transactions provide ACID guarantees for multiple operations. Changes made within
+/// a transaction are not visible to other operations until `commit()` is called.
+/// If the transaction is dropped without calling `commit()`, all changes are rolled back.
 pub trait Transaction {
     /// Get a value by key within the transaction
     fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>>;
@@ -46,6 +50,13 @@ pub trait Transaction {
     
     /// Scan for keys with a given prefix within the transaction
     fn scan_prefix(&self, prefix: &[u8]) -> StorageResult<PrefixIterator>;
+    
+    /// Commit the transaction, making all changes permanent and visible to other operations
+    /// 
+    /// This method consumes the transaction. After calling commit(), the transaction
+    /// cannot be used for further operations. If commit() fails, all changes in the
+    /// transaction are rolled back.
+    fn commit(self) -> StorageResult<()>;
 }
 
 /// Core trait defining the interface for key-value storage backends
