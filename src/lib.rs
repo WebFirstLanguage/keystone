@@ -4,6 +4,8 @@
 //! built on top of redb. It follows a bucket/key/object hierarchy similar to S3.
 
 pub mod storage;
+pub mod data;
 
 // Re-export main types that will be used by consumers
 pub use storage::StorageError;
+pub use data::{Object, ObjectMetadata};
