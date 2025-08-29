@@ -1,0 +1,385 @@
+//! redb adapter implementing the KeyValueStore trait
+//! 
+//! This module provides a concrete implementation of the KeyValueStore trait
+//! using redb as the underlying storage engine. It handles the translation
+//! between our generic storage interface and redb's specific API.
+
+use std::path::Path;
+use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
+use crate::storage::{KeyValueStore, StorageError, StorageResult, Transaction, PrefixIterator};
+
+/// Table definition for the main key-value store
+const MAIN_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("main");
+
+/// redb implementation of the KeyValueStore trait
+pub struct RedbAdapter {
+    database: Database,
+}
+
+/// Transaction wrapper for redb write transactions
+pub struct RedbTransaction {
+    txn: WriteTransaction,
+}
+
+impl Transaction for RedbTransaction {
+    fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        let table = self.txn.open_table(MAIN_TABLE)
+            .map_err(|e| StorageError::TransactionError(e.to_string()))?;
+        
+        let result = table.get(key)
+            .map_err(|e| StorageError::TransactionError(e.to_string()))?;
+            
+        match result {
+            Some(value) => Ok(Some(value.value().to_vec())),
+            None => Ok(None),
+        }
+    }
+    
+    fn put(&mut self, key: &[u8], value: &[u8]) -> StorageResult<()> {
+        let mut table = self.txn.open_table(MAIN_TABLE)
+            .map_err(|e| StorageError::TransactionError(e.to_string()))?;
+        
+        table.insert(key, value)
+            .map_err(|e| StorageError::TransactionError(e.to_string()))?;
+        
+        Ok(())
+    }
+    
+    fn delete(&mut self, key: &[u8]) -> StorageResult<()> {
+        let mut table = self.txn.open_table(MAIN_TABLE)
+            .map_err(|e| StorageError::TransactionError(e.to_string()))?;
+        
+        table.remove(key)
+            .map_err(|e| StorageError::TransactionError(e.to_string()))?;
+        
+        Ok(())
+    }
+    
+    fn scan_prefix(&self, prefix: &[u8]) -> StorageResult<PrefixIterator> {
+        let table = self.txn.open_table(MAIN_TABLE)
+            .map_err(|e| StorageError::TransactionError(e.to_string()))?;
+        
+        // Create a range that starts with the prefix
+        let start_bound = prefix;
+        let mut end_bound = prefix.to_vec();
+        
+        // Increment the last byte to create an exclusive end bound
+        // Handle the case where prefix ends with 0xFF
+        if let Some(last_byte) = end_bound.last_mut() {
+            if *last_byte == 0xFF {
+                // If the last byte is 0xFF, we need to find the rightmost non-0xFF byte
+                let mut pos = end_bound.len();
+                while pos > 0 {
+                    pos -= 1;
+                    if end_bound[pos] != 0xFF {
+                        end_bound[pos] += 1;
+                        end_bound.truncate(pos + 1);
+                        break;
+                    }
+                }
+                // If all bytes are 0xFF, we scan to the end
+                if pos == 0 && end_bound[0] == 0xFF {
+                    end_bound.clear(); // Empty slice means scan to end
+                }
+            } else {
+                *last_byte += 1;
+            }
+        }
+        
+        let range_iter = if end_bound.is_empty() {
+            table.range(start_bound..)
+                .map_err(|e| StorageError::TransactionError(e.to_string()))?
+        } else {
+            table.range(start_bound..end_bound.as_slice())
+                .map_err(|e| StorageError::TransactionError(e.to_string()))?
+        };
+        
+        let vec_iter: Vec<_> = range_iter
+            .map(|result| {
+                result
+                    .map(|(k, v)| (k.value().to_vec(), v.value().to_vec()))
+                    .map_err(|e| StorageError::TransactionError(e.to_string()))
+            })
+            .collect();
+        
+        Ok(Box::new(vec_iter.into_iter()))
+    }
+}
+
+impl KeyValueStore for RedbAdapter {
+    type Transaction = RedbTransaction;
+    
+    fn open<P: AsRef<Path>>(path: P) -> StorageResult<Self> {
+        let database = Database::create(path)
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        
+        Ok(RedbAdapter { database })
+    }
+    
+    fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        let read_txn = self.database.begin_read()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        
+        let table = read_txn.open_table(MAIN_TABLE)
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        
+        let result = table.get(key)
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            
+        match result {
+            Some(value) => Ok(Some(value.value().to_vec())),
+            None => Ok(None),
+        }
+    }
+    
+    fn put(&self, key: &[u8], value: &[u8]) -> StorageResult<()> {
+        let write_txn = self.database.begin_write()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        
+        {
+            let mut table = write_txn.open_table(MAIN_TABLE)
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            
+            table.insert(key, value)
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        }
+        
+        write_txn.commit()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        
+        Ok(())
+    }
+    
+    fn delete(&self, key: &[u8]) -> StorageResult<()> {
+        let write_txn = self.database.begin_write()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        
+        {
+            let mut table = write_txn.open_table(MAIN_TABLE)
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            
+            table.remove(key)
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        }
+        
+        write_txn.commit()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        
+        Ok(())
+    }
+    
+    fn scan_prefix(&self, prefix: &[u8]) -> StorageResult<PrefixIterator> {
+        let read_txn = self.database.begin_read()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        
+        let table = read_txn.open_table(MAIN_TABLE)
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        
+        // Create a range that starts with the prefix
+        let start_bound = prefix;
+        let mut end_bound = prefix.to_vec();
+        
+        // Increment the last byte to create an exclusive end bound
+        if let Some(last_byte) = end_bound.last_mut() {
+            if *last_byte == 0xFF {
+                // Handle case where prefix ends with 0xFF
+                let mut pos = end_bound.len();
+                while pos > 0 {
+                    pos -= 1;
+                    if end_bound[pos] != 0xFF {
+                        end_bound[pos] += 1;
+                        end_bound.truncate(pos + 1);
+                        break;
+                    }
+                }
+                if pos == 0 && end_bound[0] == 0xFF {
+                    end_bound.clear(); // Scan to end
+                }
+            } else {
+                *last_byte += 1;
+            }
+        }
+        
+        let range_iter = if end_bound.is_empty() {
+            table.range(start_bound..)
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        } else {
+            table.range(start_bound..end_bound.as_slice())
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        };
+        
+        // Collect results to avoid lifetime issues with the transaction
+        let vec_iter: Vec<_> = range_iter
+            .map(|result| {
+                result
+                    .map(|(k, v)| (k.value().to_vec(), v.value().to_vec()))
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))
+            })
+            .collect();
+        
+        Ok(Box::new(vec_iter.into_iter()))
+    }
+    
+    fn begin_transaction(&self) -> StorageResult<Self::Transaction> {
+        let txn = self.database.begin_write()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        
+        Ok(RedbTransaction { txn })
+    }
+    
+    fn transaction<T, F>(&self, f: F) -> StorageResult<T>
+    where
+        F: FnOnce(&mut Self::Transaction) -> StorageResult<T>,
+    {
+        let write_txn = self.database.begin_write()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        
+        let mut txn_wrapper = RedbTransaction { txn: write_txn };
+        let result = f(&mut txn_wrapper)?;
+        
+        txn_wrapper.txn.commit()
+            .map_err(|e| StorageError::TransactionError(e.to_string()))?;
+        
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    
+    fn create_test_adapter() -> (RedbAdapter, tempfile::TempDir) {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+        let adapter = RedbAdapter::open(&db_path).unwrap();
+        (adapter, temp_dir)
+    }
+    
+    #[test]
+    fn test_basic_put_get() {
+        let (adapter, _temp_dir) = create_test_adapter();
+        
+        let key = b"test_key";
+        let value = b"test_value";
+        
+        // Put a value
+        adapter.put(key, value).unwrap();
+        
+        // Get the value back
+        let retrieved = adapter.get(key).unwrap();
+        assert_eq!(retrieved, Some(value.to_vec()));
+        
+        // Test non-existent key
+        let non_existent = adapter.get(b"non_existent").unwrap();
+        assert_eq!(non_existent, None);
+    }
+    
+    #[test]
+    fn test_delete() {
+        let (adapter, _temp_dir) = create_test_adapter();
+        
+        let key = b"test_key";
+        let value = b"test_value";
+        
+        // Put and verify
+        adapter.put(key, value).unwrap();
+        assert_eq!(adapter.get(key).unwrap(), Some(value.to_vec()));
+        
+        // Delete and verify
+        adapter.delete(key).unwrap();
+        assert_eq!(adapter.get(key).unwrap(), None);
+    }
+    
+    #[test]
+    fn test_prefix_scan() {
+        let (adapter, _temp_dir) = create_test_adapter();
+        
+        // Insert test data
+        adapter.put(b"bucket1\x00key1", b"value1").unwrap();
+        adapter.put(b"bucket1\x00key2", b"value2").unwrap();
+        adapter.put(b"bucket2\x00key3", b"value3").unwrap();
+        adapter.put(b"other_key", b"other_value").unwrap();
+        
+        // Scan for bucket1 prefix
+        let results: Vec<_> = adapter.scan_prefix(b"bucket1\x00")
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&(b"bucket1\x00key1".to_vec(), b"value1".to_vec())));
+        assert!(results.contains(&(b"bucket1\x00key2".to_vec(), b"value2".to_vec())));
+    }
+    
+    #[test]
+    fn test_transaction() {
+        let (adapter, _temp_dir) = create_test_adapter();
+        
+        // Test successful transaction
+        let result = adapter.transaction(|txn| {
+            txn.put(b"key1", b"value1")?;
+            txn.put(b"key2", b"value2")?;
+            Ok("success")
+        });
+        
+        assert_eq!(result.unwrap(), "success");
+        assert_eq!(adapter.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+        assert_eq!(adapter.get(b"key2").unwrap(), Some(b"value2".to_vec()));
+    }
+    
+    #[test]
+    fn test_transaction_rollback() {
+        let (adapter, _temp_dir) = create_test_adapter();
+        
+        // Put initial data
+        adapter.put(b"existing_key", b"existing_value").unwrap();
+        
+        // Test failed transaction (should rollback)
+        let result: StorageResult<()> = adapter.transaction(|txn| {
+            txn.put(b"key1", b"value1")?;
+            txn.put(b"key2", b"value2")?;
+            Err(StorageError::InvalidKey) // Force failure
+        });
+        
+        assert!(result.is_err());
+        
+        // Verify that the transaction was rolled back
+        assert_eq!(adapter.get(b"key1").unwrap(), None);
+        assert_eq!(adapter.get(b"key2").unwrap(), None);
+        
+        // Verify existing data is still there
+        assert_eq!(adapter.get(b"existing_key").unwrap(), Some(b"existing_value".to_vec()));
+    }
+    
+    #[test]
+    fn test_empty_prefix_scan() {
+        let (adapter, _temp_dir) = create_test_adapter();
+        
+        adapter.put(b"key1", b"value1").unwrap();
+        adapter.put(b"key2", b"value2").unwrap();
+        
+        // Scan with empty prefix should return all keys
+        let results: Vec<_> = adapter.scan_prefix(b"")
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        
+        assert_eq!(results.len(), 2);
+    }
+    
+    #[test]
+    fn test_prefix_scan_no_matches() {
+        let (adapter, _temp_dir) = create_test_adapter();
+        
+        adapter.put(b"key1", b"value1").unwrap();
+        
+        // Scan for non-matching prefix
+        let results: Vec<_> = adapter.scan_prefix(b"nomatch")
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        
+        assert_eq!(results.len(), 0);
+    }
+}
