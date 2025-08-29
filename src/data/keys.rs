@@ -352,7 +352,8 @@ mod tests {
     #[test]
     fn test_generate_chunk_key() {
         let key = generate_chunk_key("media", "video.mp4", 5).unwrap();
-        assert_eq!(key, b"__data__\0media\0video.mp4\05");
+        let expected = [b"__data__\0media\0video.mp4\0".as_ref(), b"5".as_ref()].concat();
+        assert_eq!(key, expected);
     }
     
     #[test]
@@ -364,7 +365,8 @@ mod tests {
     #[test]
     fn test_generate_object_prefix() {
         let prefix = generate_object_prefix("logs", "2024-01").unwrap();
-        assert_eq!(prefix, b"logs\02024-01");
+        let expected = [b"logs\0".as_ref(), b"2024-01".as_ref()].concat();
+        assert_eq!(prefix, expected);
     }
     
     #[test]
@@ -404,8 +406,8 @@ mod tests {
     
     #[test]
     fn test_parse_chunk_key() {
-        let chunk_key = b"__data__\0media\0video.mp4\05";
-        let (bucket, key, chunk_num) = parse_chunk_key(chunk_key).unwrap();
+        let chunk_key = [b"__data__\0media\0video.mp4\0".as_ref(), b"5".as_ref()].concat();
+        let (bucket, key, chunk_num) = parse_chunk_key(&chunk_key).unwrap();
         assert_eq!(bucket, "media");
         assert_eq!(key, "video.mp4");
         assert_eq!(chunk_num, 5);
