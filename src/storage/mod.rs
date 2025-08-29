@@ -94,9 +94,34 @@ pub trait KeyValueStore: Send + Sync {
     
     /// Execute a closure within a transaction, automatically committing on success
     /// or rolling back on error
+    /// 
+    /// This method provides a default implementation that:
+    /// 1. Begins a new transaction via `begin_transaction()`
+    /// 2. Executes the provided closure with the transaction
+    /// 3. Commits the transaction if the closure returns `Ok`
+    /// 4. Automatically rolls back if the closure returns `Err` (transaction is dropped)
+    /// 
+    /// Implementations can override this if they need custom transaction behavior.
     fn transaction<T, F>(&self, f: F) -> StorageResult<T>
     where
-        F: FnOnce(&mut Self::Transaction) -> StorageResult<T>;
+        F: FnOnce(&mut Self::Transaction) -> StorageResult<T>,
+    {
+        let mut txn = self.begin_transaction()?;
+        
+        match f(&mut txn) {
+            Ok(result) => {
+                // Commit the transaction on success
+                txn.commit()?;
+                Ok(result)
+            },
+            Err(err) => {
+                // Transaction will be automatically rolled back when dropped
+                // This is the standard behavior for most transaction implementations
+                // including redb, where uncommitted transactions are rolled back
+                Err(err)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -121,5 +146,44 @@ mod tests {
         let debug_str = format!("{:?}", err);
         assert!(debug_str.contains("DatabaseError"));
         assert!(debug_str.contains("test error"));
+    }
+    
+    #[test]
+    fn test_default_transaction_implementation() {
+        use super::redb_adapter::RedbAdapter;
+        use tempfile::tempdir;
+        
+        // Test that the default transaction implementation works with RedbAdapter
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+        let adapter = RedbAdapter::open(&db_path).unwrap();
+        
+        // Test successful transaction using default implementation
+        let result = adapter.transaction(|txn| {
+            txn.put(b"default_key1", b"default_value1")?;
+            txn.put(b"default_key2", b"default_value2")?;
+            Ok("success")
+        });
+        
+        assert_eq!(result.unwrap(), "success");
+        
+        // Verify the changes were committed
+        assert_eq!(adapter.get(b"default_key1").unwrap(), Some(b"default_value1".to_vec()));
+        assert_eq!(adapter.get(b"default_key2").unwrap(), Some(b"default_value2".to_vec()));
+        
+        // Test failed transaction using default implementation  
+        adapter.put(b"existing_key", b"existing_value").unwrap();
+        
+        let result: StorageResult<()> = adapter.transaction(|txn| {
+            txn.put(b"temp_key", b"temp_value")?;
+            txn.delete(b"existing_key")?;
+            Err(StorageError::InvalidKey) // Force failure
+        });
+        
+        assert!(result.is_err());
+        
+        // Verify the transaction was rolled back
+        assert_eq!(adapter.get(b"temp_key").unwrap(), None); // Should not exist
+        assert_eq!(adapter.get(b"existing_key").unwrap(), Some(b"existing_value".to_vec())); // Should be unchanged
     }
 }

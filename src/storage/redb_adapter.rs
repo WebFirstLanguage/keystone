@@ -239,21 +239,6 @@ impl KeyValueStore for RedbAdapter {
         Ok(RedbTransaction { txn })
     }
     
-    fn transaction<T, F>(&self, f: F) -> StorageResult<T>
-    where
-        F: FnOnce(&mut Self::Transaction) -> StorageResult<T>,
-    {
-        let write_txn = self.database.begin_write()
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-        
-        let mut txn_wrapper = RedbTransaction { txn: write_txn };
-        let result = f(&mut txn_wrapper)?;
-        
-        txn_wrapper.txn.commit()
-            .map_err(|e| StorageError::TransactionError(e.to_string()))?;
-        
-        Ok(result)
-    }
 }
 
 #[cfg(test)]
