@@ -61,37 +61,14 @@ impl Transaction for RedbTransaction {
         
         // Create a range that starts with the prefix
         let start_bound = prefix;
-        let mut end_bound = prefix.to_vec();
         
-        // Increment the last byte to create an exclusive end bound
-        // Handle the case where prefix ends with 0xFF
-        if let Some(last_byte) = end_bound.last_mut() {
-            if *last_byte == 0xFF {
-                // If the last byte is 0xFF, we need to find the rightmost non-0xFF byte
-                let mut pos = end_bound.len();
-                while pos > 0 {
-                    pos -= 1;
-                    if end_bound[pos] != 0xFF {
-                        end_bound[pos] += 1;
-                        end_bound.truncate(pos + 1);
-                        break;
-                    }
-                }
-                // If all bytes are 0xFF, we scan to the end
-                if pos == 0 && end_bound[0] == 0xFF {
-                    end_bound.clear(); // Empty slice means scan to end
-                }
-            } else {
-                *last_byte += 1;
-            }
-        }
-        
-        let range_iter = if end_bound.is_empty() {
-            table.range(start_bound..)
-                .map_err(|e| StorageError::TransactionError(e.to_string()))?
-        } else {
-            table.range(start_bound..end_bound.as_slice())
-                .map_err(|e| StorageError::TransactionError(e.to_string()))?
+        let range_iter = match RedbAdapter::compute_exclusive_end_bound(prefix) {
+            None => table.range(start_bound..)
+                .map_err(|e| StorageError::TransactionError(e.to_string()))?,
+            Some(end) if end.is_empty() => table.range(start_bound..)
+                .map_err(|e| StorageError::TransactionError(e.to_string()))?,
+            Some(end) => table.range(start_bound..end.as_slice())
+                .map_err(|e| StorageError::TransactionError(e.to_string()))?,
         };
         
         // Note: Currently collecting due to lifetime constraints between table and transaction.
@@ -111,6 +88,36 @@ impl Transaction for RedbTransaction {
     fn commit(self) -> StorageResult<()> {
         self.txn.commit()
             .map_err(|e| StorageError::TransactionError(e.to_string()))
+    }
+}
+
+impl RedbAdapter {
+    /// Compute exclusive end bound for prefix scanning
+    /// 
+    /// Returns:
+    /// - `None` for unbounded scan (all bytes are 0xFF)  
+    /// - `Some(Vec::new())` for scan to end (empty prefix case)
+    /// - `Some(Vec<u8>)` for bounded scan with computed end bound
+    fn compute_exclusive_end_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+        if prefix.is_empty() {
+            return Some(Vec::new()); // Signal scan to end
+        }
+        
+        let mut end_bound = prefix.to_vec();
+        let mut pos = end_bound.len();
+        
+        // Find rightmost byte that can be incremented
+        while pos > 0 {
+            pos -= 1;
+            if end_bound[pos] != 0xFF {
+                end_bound[pos] += 1;
+                end_bound.truncate(pos + 1);
+                return Some(end_bound);
+            }
+        }
+        
+        // All bytes are 0xFF - unbounded scan
+        None
     }
 }
 
@@ -201,35 +208,14 @@ impl KeyValueStore for RedbAdapter {
         
         // Create a range that starts with the prefix
         let start_bound = prefix;
-        let mut end_bound = prefix.to_vec();
         
-        // Increment the last byte to create an exclusive end bound
-        if let Some(last_byte) = end_bound.last_mut() {
-            if *last_byte == 0xFF {
-                // Handle case where prefix ends with 0xFF
-                let mut pos = end_bound.len();
-                while pos > 0 {
-                    pos -= 1;
-                    if end_bound[pos] != 0xFF {
-                        end_bound[pos] += 1;
-                        end_bound.truncate(pos + 1);
-                        break;
-                    }
-                }
-                if pos == 0 && end_bound[0] == 0xFF {
-                    end_bound.clear(); // Scan to end
-                }
-            } else {
-                *last_byte += 1;
-            }
-        }
-        
-        let range_iter = if end_bound.is_empty() {
-            table.range(start_bound..)
-                .map_err(|e| StorageError::DatabaseError(e.to_string()))?
-        } else {
-            table.range(start_bound..end_bound.as_slice())
-                .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        let range_iter = match Self::compute_exclusive_end_bound(prefix) {
+            None => table.range(start_bound..)
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+            Some(end) if end.is_empty() => table.range(start_bound..)
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+            Some(end) => table.range(start_bound..end.as_slice())
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
         };
         
         // Note: We collect here because this method creates its own read transaction
@@ -576,5 +562,52 @@ mod tests {
         
         // Transaction can still be committed after iterator use
         txn.commit().unwrap();
+    }
+    
+    #[test]
+    fn test_compute_exclusive_end_bound() {
+        // Test empty prefix
+        let result = RedbAdapter::compute_exclusive_end_bound(b"");
+        assert_eq!(result, Some(Vec::new()));
+        
+        // Test normal prefix increment (b"abc" -> b"abd")
+        let result = RedbAdapter::compute_exclusive_end_bound(b"abc");
+        assert_eq!(result, Some(b"abd".to_vec()));
+        
+        // Test single byte increment
+        let result = RedbAdapter::compute_exclusive_end_bound(b"a");
+        assert_eq!(result, Some(b"b".to_vec()));
+        
+        // Test 0xFF handling (b"ab\xFF" -> b"ac")  
+        let result = RedbAdapter::compute_exclusive_end_bound(b"ab\xFF");
+        assert_eq!(result, Some(b"ac".to_vec()));
+        
+        // Test multiple 0xFF handling (b"a\xFF\xFF" -> b"b")
+        let result = RedbAdapter::compute_exclusive_end_bound(b"a\xFF\xFF");
+        assert_eq!(result, Some(b"b".to_vec()));
+        
+        // Test all 0xFF handling (b"\xFF\xFF" -> None for unbounded)
+        let result = RedbAdapter::compute_exclusive_end_bound(b"\xFF\xFF");
+        assert_eq!(result, None);
+        
+        // Test single 0xFF byte
+        let result = RedbAdapter::compute_exclusive_end_bound(b"\xFF");
+        assert_eq!(result, None);
+        
+        // Test edge case: prefix ending with 0xFE
+        let result = RedbAdapter::compute_exclusive_end_bound(b"ab\xFE");
+        assert_eq!(result, Some(b"ab\xFF".to_vec()));
+        
+        // Test mixed bytes with 0xFF at end
+        let result = RedbAdapter::compute_exclusive_end_bound(b"test\xFF");
+        assert_eq!(result, Some(b"tesu".to_vec()));
+        
+        // Test zero byte handling
+        let result = RedbAdapter::compute_exclusive_end_bound(b"a\x00b");
+        assert_eq!(result, Some(b"a\x00c".to_vec()));
+        
+        // Test prefix that would increment to create longer result
+        let result = RedbAdapter::compute_exclusive_end_bound(b"test");
+        assert_eq!(result, Some(b"tesu".to_vec()));
     }
 }
