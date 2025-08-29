@@ -131,7 +131,7 @@ impl KeyValueStore for RedbAdapter {
             }
             
             write_txn.commit()
-                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+                .map_err(|e| StorageError::TransactionError(e.to_string()))?;
         }
         
         Ok(RedbAdapter { database })
@@ -166,7 +166,7 @@ impl KeyValueStore for RedbAdapter {
         }
         
         write_txn.commit()
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            .map_err(|e| StorageError::TransactionError(e.to_string()))?;
         
         Ok(())
     }
@@ -184,7 +184,7 @@ impl KeyValueStore for RedbAdapter {
         }
         
         write_txn.commit()
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            .map_err(|e| StorageError::TransactionError(e.to_string()))?;
         
         Ok(())
     }
