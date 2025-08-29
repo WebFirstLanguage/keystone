@@ -112,11 +112,20 @@ impl ChunkingStrategy {
     }
     
     /// Creates a new chunking strategy with a custom chunk size
+    #[deprecated(note = "use `try_with_chunk_size` for fallible validation")]
     pub fn with_chunk_size(chunk_size: usize) -> Self {
         if chunk_size == 0 {
             panic!("Chunk size cannot be zero");
         }
         Self { chunk_size }
+    }
+
+    /// Fallible constructor that returns an error instead of panicking.
+    pub fn try_with_chunk_size(chunk_size: usize) -> StorageResult<Self> {
+        if chunk_size == 0 {
+            return Err(StorageError::DatabaseError("chunk_size must be > 0".to_string()));
+        }
+        Ok(Self { chunk_size })
     }
     
     /// Determines if an object should be chunked based on its size
@@ -484,7 +493,7 @@ mod tests {
     #[test]
     fn test_store_and_retrieve_chunked_object() {
         let storage = MockStorage::new();
-        let strategy = ChunkingStrategy::with_chunk_size(8192); // 8KB chunks for testing
+        let strategy = ChunkingStrategy::try_with_chunk_size(8192).unwrap(); // 8KB chunks for testing
         
         // Create a large object that will be chunked - needs to be > MIN_CHUNK_THRESHOLD (1MB)
         let large_data = "A".repeat(MIN_CHUNK_THRESHOLD + 10000); // 1MB + 10KB
@@ -510,7 +519,7 @@ mod tests {
     #[test]
     fn test_delete_chunked_object() {
         let storage = MockStorage::new();
-        let strategy = ChunkingStrategy::with_chunk_size(8192); // 8KB chunks
+        let strategy = ChunkingStrategy::try_with_chunk_size(8192).unwrap(); // 8KB chunks
         
         // Create a large object that will be chunked - needs to be > MIN_CHUNK_THRESHOLD (1MB)
         let large_data = "B".repeat(MIN_CHUNK_THRESHOLD + 20000); // 1MB + 20KB 
@@ -560,7 +569,7 @@ mod tests {
     #[test]
     fn test_corrupted_chunk_detection() {
         let storage = MockStorage::new();
-        let strategy = ChunkingStrategy::with_chunk_size(8192); // 8KB chunks
+        let strategy = ChunkingStrategy::try_with_chunk_size(8192).unwrap(); // 8KB chunks
         
         // Create a large object that will be chunked - needs to be > MIN_CHUNK_THRESHOLD (1MB)
         let large_data = "C".repeat(MIN_CHUNK_THRESHOLD + 15000); // 1MB + 15KB
@@ -585,7 +594,7 @@ mod tests {
     #[test]
     fn test_complex_data_types_chunking() {
         let storage = MockStorage::new();
-        let strategy = ChunkingStrategy::with_chunk_size(100);
+        let strategy = ChunkingStrategy::try_with_chunk_size(100).unwrap();
         
         // Create complex data structure
         let mut data = HashMap::new();
