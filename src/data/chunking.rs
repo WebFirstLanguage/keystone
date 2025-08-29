@@ -153,7 +153,7 @@ impl ChunkingStrategy {
         if self.should_chunk(serialized_data.len()) {
             self.store_chunked_object(storage, bucket_name, object_key, &serialized_data, &object.metadata)
         } else {
-            self.store_direct_object(storage, bucket_name, object_key, &serialized_data)
+            self.store_direct_object(storage, bucket_name, object_key, &serialized_data, &object.metadata.content_type)
         }
     }
     
@@ -227,6 +227,7 @@ impl ChunkingStrategy {
         bucket_name: &str,
         object_key: &str,
         serialized_data: &[u8],
+        content_type: &str,
     ) -> StorageResult<ObjectMetadata>
     where
         S: KeyValueStore,
@@ -237,7 +238,7 @@ impl ChunkingStrategy {
         
         Ok(ObjectMetadata::new(
             serialized_data.len() as u64,
-            "application/octet-stream".to_string(),
+            content_type.to_string(),
         ))
     }
     
@@ -479,15 +480,21 @@ mod tests {
         let strategy = ChunkingStrategy::new();
         
         let data = "Small test object".to_string();
-        let object = Object::with_metadata(data.clone(), "text/plain".to_string());
+        let original_content_type = "text/plain".to_string();
+        let object = Object::with_metadata(data.clone(), original_content_type.clone());
         
         // Store object
         let metadata = strategy.store_object(&storage, "test-bucket", "small-obj", &object).unwrap();
         assert!(metadata.size > 0);
+        // Verify that the returned metadata preserves the original content type
+        assert_eq!(metadata.content_type, original_content_type, 
+                   "Content type should be preserved for small objects");
         
         // Retrieve object
         let retrieved: Object<String> = strategy.retrieve_object(&storage, "test-bucket", "small-obj").unwrap();
         assert_eq!(retrieved.data, data);
+        assert_eq!(retrieved.metadata.content_type, original_content_type,
+                   "Content type should be preserved during retrieval");
     }
     
     #[test]
@@ -610,5 +617,37 @@ mod tests {
             strategy.retrieve_object(&storage, "test-bucket", "complex-obj").unwrap();
         
         assert_eq!(retrieved.data, data);
+    }
+    
+    #[test]
+    fn test_content_type_preservation_small_objects() {
+        let storage = MockStorage::new();
+        let strategy = ChunkingStrategy::new();
+        
+        // Test various content types for small objects
+        let test_cases = vec![
+            ("application/json", "{}"),
+            ("image/png", "PNG binary data"),
+            ("text/html", "<html></html>"),
+            ("application/pdf", "PDF binary data"),
+            ("video/mp4", "MP4 binary data"),
+        ];
+        
+        for (content_type, data) in test_cases {
+            let object = Object::with_metadata(data.to_string(), content_type.to_string());
+            
+            // Store object
+            let metadata = strategy.store_object(&storage, "test-bucket", &format!("obj-{}", content_type.replace('/', "-")), &object).unwrap();
+            
+            // Verify content type is preserved in returned metadata
+            assert_eq!(metadata.content_type, content_type, 
+                      "Content type {} should be preserved for small objects", content_type);
+            
+            // Retrieve and verify
+            let retrieved: Object<String> = strategy.retrieve_object(&storage, "test-bucket", &format!("obj-{}", content_type.replace('/', "-"))).unwrap();
+            assert_eq!(retrieved.metadata.content_type, content_type,
+                      "Content type {} should be preserved during retrieval", content_type);
+            assert_eq!(retrieved.data, data);
+        }
     }
 }
