@@ -290,6 +290,11 @@ impl ChunkingStrategy {
         manifest.validate()?;
         
         // Reassemble the data from chunks
+        if manifest.total_size > usize::MAX as u64 {
+            return Err(StorageError::DatabaseError(
+                "Object too large to allocate on this platform".to_string(),
+            ));
+        }
         let mut reassembled_data = Vec::with_capacity(manifest.total_size as usize);
         
         for chunk_index in 0..manifest.chunk_count {
