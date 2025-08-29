@@ -31,7 +31,7 @@ pub enum StorageError {
 pub type StorageResult<T> = Result<T, StorageError>;
 
 /// Iterator over key-value pairs returned by prefix scans
-pub type PrefixIterator = Box<dyn Iterator<Item = StorageResult<(Vec<u8>, Vec<u8>)>>>;
+pub type PrefixIterator<'a> = Box<dyn Iterator<Item = StorageResult<(Vec<u8>, Vec<u8>)>> + 'a>;
 
 /// Transaction handle for atomic operations
 /// 
@@ -49,7 +49,7 @@ pub trait Transaction {
     fn delete(&mut self, key: &[u8]) -> StorageResult<()>;
     
     /// Scan for keys with a given prefix within the transaction
-    fn scan_prefix(&self, prefix: &[u8]) -> StorageResult<PrefixIterator>;
+    fn scan_prefix(&self, prefix: &[u8]) -> StorageResult<PrefixIterator<'_>>;
     
     /// Commit the transaction, making all changes permanent and visible to other operations
     /// 
@@ -87,7 +87,7 @@ pub trait KeyValueStore: Send + Sync {
     /// 
     /// This is essential for implementing bucket listing operations efficiently.
     /// The iterator should return keys in lexicographic order.
-    fn scan_prefix(&self, prefix: &[u8]) -> StorageResult<PrefixIterator>;
+    fn scan_prefix(&self, prefix: &[u8]) -> StorageResult<PrefixIterator<'_>>;
     
     /// Begin a new transaction for atomic operations
     fn begin_transaction(&self) -> StorageResult<Self::Transaction>;
