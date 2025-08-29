@@ -35,8 +35,8 @@ const CHUNK_DATA_PREFIX: &[u8] = b"__data__";
 /// # Errors
 /// Returns `StorageError::InvalidKey` if bucket_name or object_key contain null bytes
 pub fn generate_object_key(bucket_name: &str, object_key: &str) -> Result<Vec<u8>, StorageError> {
-    validate_user_input(bucket_name, "bucket name")?;
-    validate_user_input(object_key, "object key")?;
+    validate_user_input(bucket_name, Field::BucketName)?;
+    validate_user_input(object_key, Field::ObjectKey)?;
     
     let mut key = Vec::with_capacity(bucket_name.len() + 1 + object_key.len());
     key.extend_from_slice(bucket_name.as_bytes());
@@ -59,7 +59,7 @@ pub fn generate_object_key(bucket_name: &str, object_key: &str) -> Result<Vec<u8
 /// # Errors
 /// Returns `StorageError::InvalidKey` if bucket_name contains null bytes
 pub fn generate_bucket_metadata_key(bucket_name: &str) -> Result<Vec<u8>, StorageError> {
-    validate_user_input(bucket_name, "bucket name")?;
+    validate_user_input(bucket_name, Field::BucketName)?;
     
     let mut key = Vec::with_capacity(
         BUCKET_METADATA_PREFIX.len() + 1 + BUCKET_SECTION.len() + 1 + bucket_name.len()
@@ -93,8 +93,8 @@ pub fn generate_chunk_key(
     object_key: &str, 
     chunk_number: u64
 ) -> Result<Vec<u8>, StorageError> {
-    validate_user_input(bucket_name, "bucket name")?;
-    validate_user_input(object_key, "object key")?;
+    validate_user_input(bucket_name, Field::BucketName)?;
+    validate_user_input(object_key, Field::ObjectKey)?;
     
     let chunk_str = chunk_number.to_string();
     let mut key = Vec::with_capacity(
@@ -128,7 +128,7 @@ pub fn generate_chunk_key(
 /// # Errors
 /// Returns `StorageError::InvalidKey` if bucket_name contains null bytes
 pub fn generate_bucket_prefix(bucket_name: &str) -> Result<Vec<u8>, StorageError> {
-    validate_user_input(bucket_name, "bucket name")?;
+    validate_user_input(bucket_name, Field::BucketName)?;
     
     let mut prefix = Vec::with_capacity(bucket_name.len() + 1);
     prefix.extend_from_slice(bucket_name.as_bytes());
@@ -151,8 +151,8 @@ pub fn generate_bucket_prefix(bucket_name: &str) -> Result<Vec<u8>, StorageError
 /// # Errors
 /// Returns `StorageError::InvalidKey` if bucket_name or key_prefix contain null bytes
 pub fn generate_object_prefix(bucket_name: &str, key_prefix: &str) -> Result<Vec<u8>, StorageError> {
-    validate_user_input(bucket_name, "bucket name")?;
-    validate_user_input(key_prefix, "key prefix")?;
+    validate_user_input(bucket_name, Field::BucketName)?;
+    validate_user_input(key_prefix, Field::KeyPrefix)?;
     
     let mut prefix = Vec::with_capacity(bucket_name.len() + 1 + key_prefix.len());
     prefix.extend_from_slice(bucket_name.as_bytes());
@@ -176,8 +176,8 @@ pub fn generate_object_prefix(bucket_name: &str, key_prefix: &str) -> Result<Vec
 /// # Errors
 /// Returns `StorageError::InvalidKey` if bucket_name or object_key contain null bytes
 pub fn generate_chunk_prefix(bucket_name: &str, object_key: &str) -> Result<Vec<u8>, StorageError> {
-    validate_user_input(bucket_name, "bucket name")?;
-    validate_user_input(object_key, "object key")?;
+    validate_user_input(bucket_name, Field::BucketName)?;
+    validate_user_input(object_key, Field::ObjectKey)?;
     
     let mut prefix = Vec::with_capacity(
         CHUNK_DATA_PREFIX.len() + 1 + 
@@ -302,19 +302,26 @@ pub fn parse_chunk_key(chunk_key: &[u8]) -> Result<(String, String, u64), Storag
     Ok((bucket_name, object_key, chunk_number))
 }
 
+/// Field types for validation - ensures correct limits are applied
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    BucketName,
+    ObjectKey,
+    KeyPrefix,
+}
+
 /// Validates user input for bucket names and object keys
 /// 
 /// Checks for null bytes (which would break key parsing) and enforces length limits
 /// to prevent memory exhaustion attacks.
-fn validate_user_input(input: &str, field_name: &str) -> Result<(), StorageError> {
+fn validate_user_input(input: &str, field: Field) -> Result<(), StorageError> {
     if input.contains('\0') {
         return Err(StorageError::InvalidKey);
     }
     
-    let max_length = match field_name {
-        "bucket name" => MAX_BUCKET_NAME_LENGTH,
-        "object key" | "key prefix" => MAX_OBJECT_KEY_LENGTH,
-        _ => MAX_OBJECT_KEY_LENGTH, // Default to object key limit
+    let max_length = match field {
+        Field::BucketName => MAX_BUCKET_NAME_LENGTH,
+        Field::ObjectKey | Field::KeyPrefix => MAX_OBJECT_KEY_LENGTH,
     };
     
     if input.len() > max_length {
