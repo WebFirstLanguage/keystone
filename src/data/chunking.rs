@@ -33,8 +33,8 @@ pub struct ChunkManifest {
     pub chunk_size: usize,
     /// Total size of the original object
     pub total_size: u64,
-    /// Checksum or hash of the original object (for integrity verification)
-    /// Using a simple checksum for now - could be upgraded to SHA-256 later
+    /// Truncated SHA-256 checksum of the original object (for integrity verification)
+    /// Uses first 8 bytes of SHA-256 hash for robust tamper detection
     pub checksum: u64,
     /// The content type of the original object
     pub content_type: String,
@@ -143,7 +143,7 @@ impl ChunkingStrategy {
     
     /// Stores an object, automatically choosing between direct storage and chunking
     /// 
-    /// Returns the metadata of the stored object
+    /// Returns the metadata of the stored object with accurate size and current timestamp
     pub fn store_object<T, S>(
         &self,
         storage: &S,
@@ -155,13 +155,20 @@ impl ChunkingStrategy {
         T: Serialize,
         S: KeyValueStore,
     {
-        let serialized_data = bincode::serialize(&object)
+        // Serialize only the payload data T, not the entire Object<T>
+        let payload_data = bincode::serialize(&object.data)
             .map_err(|e| StorageError::DatabaseError(format!("Serialization error: {}", e)))?;
         
-        if self.should_chunk(serialized_data.len()) {
-            self.store_chunked_object(storage, bucket_name, object_key, &serialized_data, &object.metadata)
+        // Create fresh metadata with actual serialized size and current timestamp
+        let fresh_metadata = ObjectMetadata::new(
+            payload_data.len() as u64,
+            object.metadata.content_type.clone(),
+        );
+        
+        if self.should_chunk(payload_data.len()) {
+            self.store_chunked_object(storage, bucket_name, object_key, &payload_data, &fresh_metadata)
         } else {
-            self.store_direct_object(storage, bucket_name, object_key, &serialized_data, &object.metadata.content_type)
+            self.store_direct_object(storage, bucket_name, object_key, &payload_data, &fresh_metadata)
         }
     }
     
@@ -171,14 +178,14 @@ impl ChunkingStrategy {
         storage: &S,
         bucket_name: &str,
         object_key: &str,
-        serialized_data: &[u8],
-        original_metadata: &ObjectMetadata,
+        payload_data: &[u8],
+        payload_metadata: &ObjectMetadata,
     ) -> StorageResult<ObjectMetadata>
     where
         S: KeyValueStore,
     {
         storage.transaction(|txn| {
-            let chunk_count = (serialized_data.len() + self.chunk_size - 1) / self.chunk_size;
+            let chunk_count = (payload_data.len() + self.chunk_size - 1) / self.chunk_size;
             let chunk_count = chunk_count as u64;
             
             if chunk_count > MAX_CHUNKS {
@@ -188,13 +195,13 @@ impl ChunkingStrategy {
             }
             
             // Calculate checksum
-            let checksum = self.calculate_checksum(serialized_data);
+            let checksum = self.calculate_checksum(payload_data);
             
             // Create and store chunks
             for chunk_index in 0..chunk_count {
                 let start = (chunk_index as usize) * self.chunk_size;
-                let end = std::cmp::min(start + self.chunk_size, serialized_data.len());
-                let chunk_data = &serialized_data[start..end];
+                let end = std::cmp::min(start + self.chunk_size, payload_data.len());
+                let chunk_data = &payload_data[start..end];
                 
                 let chunk_key = generate_chunk_key(bucket_name, object_key, chunk_index)?;
                 txn.put(&chunk_key, chunk_data)?;
@@ -204,15 +211,19 @@ impl ChunkingStrategy {
             let manifest = ChunkManifest::new(
                 chunk_count,
                 self.chunk_size,
-                serialized_data.len() as u64,
+                payload_data.len() as u64,
                 checksum,
-                original_metadata.content_type.clone(),
+                payload_metadata.content_type.clone(),
             );
             
-            // Store manifest as the main object
+            // Store manifest as the main object 
+            // First serialize the manifest to get its actual size
+            let manifest_serialized = bincode::serialize(&manifest)
+                .map_err(|e| StorageError::DatabaseError(format!("Manifest serialization error: {}", e)))?;
+            
             let manifest_object = Object {
                 metadata: ObjectMetadata::new(
-                    serialized_data.len() as u64,
+                    manifest_serialized.len() as u64,
                     "application/x-keystone-chunked-manifest".to_string(),
                 ),
                 data: manifest,
@@ -224,7 +235,7 @@ impl ChunkingStrategy {
             let object_key_bytes = crate::data::keys::generate_object_key(bucket_name, object_key)?;
             txn.put(&object_key_bytes, &manifest_data)?;
             
-            Ok(manifest_object.metadata)
+            Ok(payload_metadata.clone())
         })
     }
     
@@ -234,20 +245,34 @@ impl ChunkingStrategy {
         storage: &S,
         bucket_name: &str,
         object_key: &str,
-        serialized_data: &[u8],
-        content_type: &str,
+        payload_data: &[u8],
+        payload_metadata: &ObjectMetadata,
     ) -> StorageResult<ObjectMetadata>
     where
         S: KeyValueStore,
     {
         let object_key_bytes = crate::data::keys::generate_object_key(bucket_name, object_key)?;
         
-        storage.put(&object_key_bytes, serialized_data)?;
+        // For direct storage, we need to store payload + metadata together
+        // Create a wrapper that contains both
+        #[derive(Serialize)]
+        struct DirectStorageWrapper {
+            metadata: ObjectMetadata,
+            payload: Vec<u8>,
+        }
         
-        Ok(ObjectMetadata::new(
-            serialized_data.len() as u64,
-            content_type.to_string(),
-        ))
+        let wrapper = DirectStorageWrapper {
+            metadata: payload_metadata.clone(),
+            payload: payload_data.to_vec(),
+        };
+        
+        let wrapper_data = bincode::serialize(&wrapper)
+            .map_err(|e| StorageError::DatabaseError(format!("Wrapper serialization error: {}", e)))?;
+        
+        storage.put(&object_key_bytes, &wrapper_data)?;
+        
+        // Return the fresh metadata that was passed in
+        Ok(payload_metadata.clone())
     }
     
     /// Retrieves an object, handling both chunked and direct storage
@@ -266,21 +291,45 @@ impl ChunkingStrategy {
         let data = storage.get(&object_key_bytes)?
             .ok_or(StorageError::KeyNotFound)?;
         
-        // Try to deserialize as a regular object first
-        if let Ok(object) = bincode::deserialize::<Object<T>>(&data) {
-            return Ok(object);
+        // Try to deserialize as a chunked manifest first
+        if let Ok(manifest_object) = bincode::deserialize::<Object<ChunkManifest>>(&data) {
+            if manifest_object.metadata.content_type == "application/x-keystone-chunked-manifest" {
+                return self.retrieve_chunked_object(storage, bucket_name, object_key, &manifest_object.data);
+            }
         }
         
-        // Try to deserialize as a chunked manifest
-        let manifest_object: Object<ChunkManifest> = bincode::deserialize(&data)
-            .map_err(|_| StorageError::DatabaseError("Object data corrupted".to_string()))?;
-        
-        // If it's a chunked manifest, reassemble the object
-        if manifest_object.metadata.content_type == "application/x-keystone-chunked-manifest" {
-            self.retrieve_chunked_object(storage, bucket_name, object_key, &manifest_object.data)
-        } else {
-            Err(StorageError::DatabaseError("Unknown object format".to_string()))
+        // Try to deserialize as a direct storage wrapper
+        #[derive(Deserialize)]
+        struct DirectStorageWrapper {
+            metadata: ObjectMetadata,
+            payload: Vec<u8>,
         }
+        
+        if let Ok(wrapper) = bincode::deserialize::<DirectStorageWrapper>(&data) {
+            // Deserialize the payload as T
+            let payload_data: T = bincode::deserialize(&wrapper.payload)
+                .map_err(|e| StorageError::DatabaseError(format!("Payload deserialization error: {}", e)))?;
+            
+            return Ok(Object {
+                metadata: wrapper.metadata,
+                data: payload_data,
+            });
+        }
+        
+        // Fallback: try to deserialize as raw payload data T (for backward compatibility)
+        let payload_data: T = bincode::deserialize(&data)
+            .map_err(|e| StorageError::DatabaseError(format!("Deserialization error: {}", e)))?;
+        
+        // Create default metadata for legacy objects
+        let metadata = ObjectMetadata::new(
+            data.len() as u64,
+            "application/octet-stream".to_string(),
+        );
+        
+        Ok(Object {
+            metadata,
+            data: payload_data,
+        })
     }
     
     /// Retrieves and reassembles a chunked object
@@ -332,9 +381,20 @@ impl ChunkingStrategy {
             ));
         }
         
-        // Deserialize the reassembled data
-        bincode::deserialize(&reassembled_data)
-            .map_err(|e| StorageError::DatabaseError(format!("Deserialization error: {}", e)))
+        // Deserialize the reassembled data as payload T
+        let payload_data: T = bincode::deserialize(&reassembled_data)
+            .map_err(|e| StorageError::DatabaseError(format!("Deserialization error: {}", e)))?;
+        
+        // Create metadata based on the manifest information
+        let metadata = ObjectMetadata::new(
+            manifest.total_size,
+            manifest.content_type.clone(),
+        );
+        
+        Ok(Object {
+            metadata,
+            data: payload_data,
+        })
     }
     
     /// Deletes an object, handling both chunked and direct storage
@@ -784,5 +844,128 @@ mod tests {
         // Zero-sized object edge case
         let zero_sized = ChunkManifest::new(1, 1000, 0, 0, "text/plain".to_string());
         assert_eq!(zero_sized.chunk_size_for_index(0), 0);  // Even first chunk is 0 for zero-sized object
+    }
+    
+    #[test]
+    fn test_fresh_metadata_accuracy() {
+        // Test that stored objects have accurate, fresh metadata (not stale)
+        let storage = MockStorage::new();
+        let strategy = ChunkingStrategy::new();
+        
+        // Record the time before storage
+        let before_storage = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        
+        // Test with small object (direct storage)
+        let small_data = "Test data for metadata verification".to_string();
+        let small_object = Object::with_metadata(small_data.clone(), "text/plain".to_string());
+        
+        // Store the object and get returned metadata
+        let stored_metadata = strategy.store_object(&storage, "test-bucket", "small-obj", &small_object).unwrap();
+        
+        // Record time after storage
+        let after_storage = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        
+        // Verify size is accurate (should match serialized payload size, not original metadata size)
+        let expected_payload_size = bincode::serialize(&small_data).unwrap().len() as u64;
+        assert_eq!(stored_metadata.size, expected_payload_size, 
+                  "Stored metadata size should match actual serialized payload size");
+        
+        // Verify timestamp is fresh (between before_storage and after_storage)
+        assert!(stored_metadata.last_modified >= before_storage, 
+                "Stored metadata timestamp should be >= time before storage");
+        assert!(stored_metadata.last_modified <= after_storage, 
+                "Stored metadata timestamp should be <= time after storage");
+        
+        // Verify content type is preserved
+        assert_eq!(stored_metadata.content_type, "text/plain", 
+                  "Content type should be preserved from original object");
+        
+        // Retrieve the object and verify metadata consistency
+        let retrieved_object: Object<String> = strategy.retrieve_object(&storage, "test-bucket", "small-obj").unwrap();
+        assert_eq!(retrieved_object.metadata.size, expected_payload_size,
+                  "Retrieved metadata size should match stored size");
+        assert_eq!(retrieved_object.metadata.content_type, "text/plain",
+                  "Retrieved metadata content type should be preserved");
+        assert_eq!(retrieved_object.data, small_data,
+                  "Retrieved data should match original");
+        
+        // Test with large object (chunked storage) 
+        let strategy_chunked = ChunkingStrategy::try_with_chunk_size(8192).unwrap(); // 8KB chunks
+        let large_data = "X".repeat(MIN_CHUNK_THRESHOLD + 10000); // 1MB + 10KB
+        let large_object = Object::with_metadata(large_data.clone(), "application/custom".to_string());
+        
+        // Verify this will be chunked
+        let serialized_size = bincode::serialize(&large_data).unwrap().len();
+        assert!(strategy_chunked.should_chunk(serialized_size), "Large object should be chunked");
+        
+        let chunked_stored_metadata = strategy_chunked.store_object(&storage, "test-bucket", "large-obj", &large_object).unwrap();
+        
+        // For chunked objects, verify size matches payload size
+        let expected_chunked_payload_size = bincode::serialize(&large_data).unwrap().len() as u64;
+        assert_eq!(chunked_stored_metadata.size, expected_chunked_payload_size,
+                  "Chunked object metadata size should match serialized payload size");
+        
+        // Verify content type is preserved for chunked objects
+        assert_eq!(chunked_stored_metadata.content_type, "application/custom",
+                  "Content type should be preserved for chunked objects");
+        
+        // Retrieve chunked object and verify
+        let retrieved_chunked: Object<String> = strategy_chunked.retrieve_object(&storage, "test-bucket", "large-obj").unwrap();
+        assert_eq!(retrieved_chunked.metadata.content_type, "application/custom",
+                  "Retrieved chunked object should preserve content type");
+        assert_eq!(retrieved_chunked.data, large_data,
+                  "Retrieved chunked data should match original");
+    }
+    
+    #[test]
+    fn test_stale_metadata_eliminated() {
+        // Test that demonstrates the old stale metadata problem is fixed
+        let storage = MockStorage::new();
+        let strategy = ChunkingStrategy::new();
+        
+        // Create object with deliberately incorrect/stale metadata
+        let test_data = "Actual payload data".to_string();
+        let stale_metadata = ObjectMetadata::with_timestamp(
+            999999,  // Wrong size (actual serialized size will be different)
+            "wrong/content-type".to_string(),  // We'll override this
+            1234567890  // Old timestamp from 2009
+        );
+        
+        let object_with_stale_metadata = Object {
+            metadata: stale_metadata,
+            data: test_data.clone(),
+        };
+        
+        // Override content type to what we actually want
+        let mut corrected_object = object_with_stale_metadata;
+        corrected_object.metadata.content_type = "text/plain".to_string();
+        
+        // Store the object
+        let stored_metadata = strategy.store_object(&storage, "test-bucket", "corrected-obj", &corrected_object).unwrap();
+        
+        // Verify that fresh, accurate metadata was used, not the stale metadata
+        let actual_payload_size = bincode::serialize(&test_data).unwrap().len() as u64;
+        assert_eq!(stored_metadata.size, actual_payload_size,
+                  "Should use actual payload size, not stale metadata size");
+        assert_ne!(stored_metadata.size, 999999,
+                  "Should not use the stale size from input metadata");
+        
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        assert!(stored_metadata.last_modified > 1234567890,
+                "Should use current timestamp, not stale timestamp from 2009");
+        assert!(stored_metadata.last_modified >= current_time - 10,
+                "Should use recent timestamp (within last 10 seconds)");
+        
+        assert_eq!(stored_metadata.content_type, "text/plain",
+                  "Should preserve the correct content type");
     }
 }
