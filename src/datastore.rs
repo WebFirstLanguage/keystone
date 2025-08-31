@@ -62,6 +62,10 @@ impl Datastore {
     }
 
     /// Execute a closure within a transaction for atomic operations
+    ///
+    /// # Rollback Behavior
+    /// If the closure returns an `Err`, the transaction is automatically
+    /// rolled back and no changes are persisted.
     pub fn transaction<T, F>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&mut dyn Transaction) -> Result<T>,
