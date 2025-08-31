@@ -28,6 +28,7 @@ pub fn parse_object_key(key: &[u8]) -> Option<(String, String)> {
 /// Generate the key for bucket metadata using the format:
 /// `__meta__\0bucket\0<bucket_name>`
 pub fn bucket_metadata_key(bucket: &str) -> Vec<u8> {
+    assert!(!bucket.contains('\0'), "bucket contains NUL byte");
     let mut key = b"__meta__\0bucket\0".to_vec();
     key.extend_from_slice(bucket.as_bytes());
     key
@@ -46,8 +47,8 @@ pub fn parse_bucket_metadata_key(key: &[u8]) -> Option<String> {
 /// Generate a key for a chunk of a large object using the format:
 /// `__data__\0<bucket_name>\0<object_key>\0<chunk_part_number>`
 pub fn chunk_key(bucket: &str, object: &str, part: u32) -> Vec<u8> {
-    assert!(!bucket.as_bytes().contains(&0), "bucket contains NUL byte");
-    assert!(!object.as_bytes().contains(&0), "object contains NUL byte");
+    assert!(!bucket.contains('\0'), "bucket contains NUL byte");
+    assert!(!object.contains('\0'), "object contains NUL byte");
 
     let prefix = b"__data__\0";
     let capacity = prefix.len() + bucket.len() + 1 + object.len() + 1 + 10;
@@ -95,5 +96,23 @@ mod tests {
     #[should_panic]
     fn object_key_rejects_nul() {
         let _ = object_key("buck\0et", "obj");
+    }
+
+    #[test]
+    #[should_panic]
+    fn bucket_metadata_key_rejects_nul() {
+        let _ = bucket_metadata_key("buck\0et");
+    }
+
+    #[test]
+    #[should_panic]
+    fn chunk_key_rejects_nul_in_object() {
+        let _ = chunk_key("bucket", "ob\0j", 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn chunk_key_rejects_nul_in_bucket() {
+        let _ = chunk_key("buck\0et", "obj", 0);
     }
 }
