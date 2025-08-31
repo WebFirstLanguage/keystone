@@ -23,6 +23,14 @@ pub enum Error {
     /// Requested object was not found
     #[error("object not found")]
     ObjectNotFound,
+
+    /// Invalid bucket name (e.g., contains NUL)
+    #[error("invalid bucket name: {0}")]
+    InvalidBucketName(String),
+
+    /// Invalid object key or prefix (e.g., contains NUL)
+    #[error("invalid object key: {0}")]
+    InvalidObjectKey(String),
 }
 
 /// Result type for public API operations

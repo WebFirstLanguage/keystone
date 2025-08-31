@@ -22,6 +22,9 @@ impl Datastore {
 
     /// Create a new bucket
     pub fn create_bucket(&self, name: &str) -> Result<()> {
+        if name.as_bytes().contains(&0) {
+            return Err(Error::InvalidBucketName(name.to_string()));
+        }
         let meta_key = keys::bucket_metadata_key(name);
         if self.store.get(&meta_key)?.is_some() {
             return Err(Error::BucketExists);
@@ -32,6 +35,9 @@ impl Datastore {
 
     /// Delete a bucket and all of its contents
     pub fn delete_bucket(&self, name: &str) -> Result<()> {
+        if name.as_bytes().contains(&0) {
+            return Err(Error::InvalidBucketName(name.to_string()));
+        }
         let meta_key = keys::bucket_metadata_key(name);
         if self.store.get(&meta_key)?.is_none() {
             return Err(Error::BucketNotFound);
@@ -51,6 +57,9 @@ impl Datastore {
 
     /// Get a handle to an existing bucket
     pub fn bucket(&self, name: &str) -> Result<Bucket<RedbAdapter>> {
+        if name.as_bytes().contains(&0) {
+            return Err(Error::InvalidBucketName(name.to_string()));
+        }
         let meta_key = keys::bucket_metadata_key(name);
         if self.store.get(&meta_key)?.is_none() {
             return Err(Error::BucketNotFound);
