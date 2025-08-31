@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::data::keys;
-use crate::storage::{KeyValueStore, StorageResult};
+use crate::storage::{KeyValueStore, StorageError, StorageResult};
 
 /// Default chunk size for large object storage (1 MiB)
 pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
@@ -51,9 +51,8 @@ pub fn retrieve_chunks<K: KeyValueStore>(
     let mut data = Vec::new();
     for chunk in &manifest.chunks {
         let key = keys::chunk_key(bucket, object, chunk.part_number);
-        if let Some(bytes) = store.get(&key)? {
-            data.extend_from_slice(&bytes);
-        }
+        let bytes = store.get(&key)?.ok_or(StorageError::KeyNotFound)?;
+        data.extend_from_slice(&bytes);
     }
     Ok(data)
 }

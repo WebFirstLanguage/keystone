@@ -29,7 +29,7 @@ mod tests {
     use super::*;
     use crate::data::chunking::{retrieve_chunks, store_chunks, DEFAULT_CHUNK_SIZE};
     use crate::data::keys;
-    use crate::storage::{KeyValueStore, PrefixIterator, StorageResult, Transaction};
+    use crate::storage::{KeyValueStore, PrefixIterator, StorageError, StorageResult, Transaction};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -171,6 +171,20 @@ mod tests {
 
         let retrieved = retrieve_chunks(&store, "bucket", "obj", &manifest).unwrap();
         assert_eq!(retrieved, data);
+    }
+
+    #[test]
+    fn missing_chunk_returns_error() {
+        let store = MockStore::default();
+        let data = vec![7u8; DEFAULT_CHUNK_SIZE + 5];
+        let manifest = store_chunks(&store, "bucket", "obj", &data, DEFAULT_CHUNK_SIZE).unwrap();
+
+        // Remove second chunk to simulate corruption
+        let missing_key = keys::chunk_key("bucket", "obj", 1);
+        store.delete(&missing_key).unwrap();
+
+        let result = retrieve_chunks(&store, "bucket", "obj", &manifest);
+        assert!(matches!(result, Err(StorageError::KeyNotFound)));
     }
 
     #[test]
