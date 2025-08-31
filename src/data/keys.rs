@@ -99,7 +99,13 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn chunk_key_rejects_nul() {
+    fn chunk_key_rejects_nul_in_object() {
         let _ = chunk_key("bucket", "ob\0j", 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn chunk_key_rejects_nul_in_bucket() {
+        let _ = chunk_key("buck\0et", "obj", 0);
     }
 }
