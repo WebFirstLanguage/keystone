@@ -28,6 +28,7 @@ pub fn parse_object_key(key: &[u8]) -> Option<(String, String)> {
 /// Generate the key for bucket metadata using the format:
 /// `__meta__\0bucket\0<bucket_name>`
 pub fn bucket_metadata_key(bucket: &str) -> Vec<u8> {
+    assert!(!bucket.contains('\0'), "bucket contains NUL byte");
     let mut key = b"__meta__\0bucket\0".to_vec();
     key.extend_from_slice(bucket.as_bytes());
     key
@@ -95,6 +96,12 @@ mod tests {
     #[should_panic]
     fn object_key_rejects_nul() {
         let _ = object_key("buck\0et", "obj");
+    }
+
+    #[test]
+    #[should_panic]
+    fn bucket_metadata_key_rejects_nul() {
+        let _ = bucket_metadata_key("buck\0et");
     }
 
     #[test]
