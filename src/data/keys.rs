@@ -3,7 +3,11 @@
 /// Generate the key for storing an object in a bucket using the format:
 /// `<bucket_name>\0<object_key>`
 pub fn object_key(bucket: &str, object: &str) -> Vec<u8> {
-    let mut key = bucket.as_bytes().to_vec();
+    assert!(!bucket.as_bytes().contains(&0), "bucket contains NUL byte");
+    assert!(!object.as_bytes().contains(&0), "object contains NUL byte");
+
+    let mut key = Vec::with_capacity(bucket.len() + 1 + object.len());
+    key.extend_from_slice(bucket.as_bytes());
     key.push(0);
     key.extend_from_slice(object.as_bytes());
     key
@@ -42,12 +46,19 @@ pub fn parse_bucket_metadata_key(key: &[u8]) -> Option<String> {
 /// Generate a key for a chunk of a large object using the format:
 /// `__data__\0<bucket_name>\0<object_key>\0<chunk_part_number>`
 pub fn chunk_key(bucket: &str, object: &str, part: u32) -> Vec<u8> {
-    let mut key = b"__data__\0".to_vec();
+    assert!(!bucket.as_bytes().contains(&0), "bucket contains NUL byte");
+    assert!(!object.as_bytes().contains(&0), "object contains NUL byte");
+
+    let prefix = b"__data__\0";
+    let capacity = prefix.len() + bucket.len() + 1 + object.len() + 1 + 10;
+    let mut key = Vec::with_capacity(capacity);
+    key.extend_from_slice(prefix);
     key.extend_from_slice(bucket.as_bytes());
     key.push(0);
     key.extend_from_slice(object.as_bytes());
     key.push(0);
-    key.extend_from_slice(part.to_string().as_bytes());
+    let part_str = format!("{:010}", part);
+    key.extend_from_slice(part_str.as_bytes());
     key
 }
 
@@ -66,4 +77,23 @@ pub fn parse_chunk_key(key: &[u8]) -> Option<(String, String, u32)> {
     let object = String::from_utf8(parts[1].to_vec()).ok()?;
     let part = String::from_utf8(parts[2].to_vec()).ok()?.parse().ok()?;
     Some((bucket, object, part))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_key_zero_pads_part() {
+        let key = chunk_key("bucket", "obj", 1);
+        let mut expected = b"__data__\0bucket\0obj\0".to_vec();
+        expected.extend_from_slice(b"0000000001");
+        assert_eq!(key, expected);
+    }
+
+    #[test]
+    #[should_panic]
+    fn object_key_rejects_nul() {
+        let _ = object_key("buck\0et", "obj");
+    }
 }
